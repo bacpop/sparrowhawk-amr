@@ -1,0 +1,327 @@
+from __future__ import annotations
+
+import argparse
+import collections
+import hashlib
+import math
+import random
+from pathlib import Path
+
+try:
+    from .common import (
+        AssemblyRecord,
+        MANIFEST_COLUMNS,
+        assembly_manifest_row,
+        json_dump,
+        load_assembly_records,
+        quantile_bin,
+        write_csv,
+    )
+except ImportError:
+    from common import (  # type: ignore
+        AssemblyRecord,
+        MANIFEST_COLUMNS,
+        assembly_manifest_row,
+        json_dump,
+        load_assembly_records,
+        quantile_bin,
+        write_csv,
+    )
+
+
+DEFAULT_ESKAPEE_TARGETS = [
+    "Enterococcus faecium",
+    "Streptococcus pneumoniae",
+    "Klebsiella pneumoniae",
+    "Acinetobacter baumannii",
+    "Pseudomonas aeruginosa",
+    "Enterobacter spp.",
+    "Escherichia coli",
+]
+
+SPECIES_ALIASES = {
+    "Acinetobacter baumanii": "Acinetobacter baumannii",
+    "Pseudomonas aeroginosa": "Pseudomonas aeruginosa",
+}
+
+
+def allocate_quotas(
+    groups: dict[str, list[AssemblyRecord]],
+    target: int,
+    min_per_species: int,
+    max_per_species: int,
+) -> dict[str, int]:
+    species = sorted(groups)
+    quotas = {sp: min(len(groups[sp]), min_per_species) for sp in species}
+    assigned = sum(quotas.values())
+    effective_target = max(target, assigned)
+
+    remaining = effective_target - assigned
+    if remaining <= 0:
+        return quotas
+
+    weights = {sp: math.sqrt(len(groups[sp])) for sp in species}
+    weight_total = sum(weights.values()) or 1.0
+    fractional = []
+    for sp in species:
+        headroom = min(len(groups[sp]), max_per_species) - quotas[sp]
+        if headroom <= 0:
+            continue
+        raw = remaining * (weights[sp] / weight_total)
+        extra = min(headroom, int(math.floor(raw)))
+        quotas[sp] += extra
+        fractional.append((raw - extra, sp))
+
+    assigned = sum(quotas.values())
+    leftover = effective_target - assigned
+    for _, sp in sorted(fractional, reverse=True):
+        if leftover <= 0:
+            break
+        headroom = min(len(groups[sp]), max_per_species) - quotas[sp]
+        if headroom <= 0:
+            continue
+        quotas[sp] += 1
+        leftover -= 1
+
+    while leftover > 0:
+        progressed = False
+        for sp in sorted(species, key=lambda name: (len(groups[name]), name), reverse=True):
+            headroom = min(len(groups[sp]), max_per_species) - quotas[sp]
+            if headroom <= 0:
+                continue
+            quotas[sp] += 1
+            leftover -= 1
+            progressed = True
+            if leftover <= 0:
+                break
+        if not progressed:
+            break
+    return quotas
+
+
+def choose_within_species(records: list[AssemblyRecord], quota: int, seed: int) -> list[AssemblyRecord]:
+    rng = random.Random(seed)
+    bins = quantile_bin(records, bins=4)
+    for bucket in bins:
+        rng.shuffle(bucket)
+        bucket.sort(key=lambda record: (-record.richness_score, -record.n_genes, record.assembly_id))
+    chosen: list[AssemblyRecord] = []
+    idx = 0
+    while len(chosen) < quota:
+        progressed = False
+        for bucket in bins:
+            if idx < len(bucket) and len(chosen) < quota:
+                chosen.append(bucket[idx])
+                progressed = True
+        if not progressed:
+            break
+        idx += 1
+    if len(chosen) < quota:
+        seen = {record.assembly_id for record in chosen}
+        for record in sorted(records, key=lambda r: (-r.richness_score, -r.n_genes, r.assembly_id)):
+            if record.assembly_id in seen:
+                continue
+            chosen.append(record)
+            if len(chosen) >= quota:
+                break
+    return chosen[:quota]
+
+
+def stable_species_seed(base_seed: int, species: str) -> int:
+    digest = hashlib.sha256(species.encode("utf-8")).hexdigest()
+    return base_seed + int(digest[:8], 16)
+
+
+def split_csv(raw: str) -> list[str]:
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+def canonical_species_name(value: str) -> str:
+    return SPECIES_ALIASES.get(value, value)
+
+
+def matches_species_target(record: AssemblyRecord, target: str) -> bool:
+    target = canonical_species_name(target)
+    species = canonical_species_name(record.species)
+    if target == "Enterobacter spp.":
+        return record.genus == "Enterobacter" or species.startswith("Enterobacter ")
+    return species == target
+
+
+def classes_in_records(records: list[AssemblyRecord]) -> list[str]:
+    return sorted({class_name for record in records for class_name in record.classes if class_name})
+
+
+def ranked_records(records: list[AssemblyRecord], seed: int) -> list[AssemblyRecord]:
+    rng = random.Random(seed)
+    shuffled = records[:]
+    rng.shuffle(shuffled)
+    return sorted(shuffled, key=lambda record: (-record.richness_score, -record.n_genes, record.assembly_id))
+
+
+def add_records_for_floor(
+    selected: list[AssemblyRecord],
+    candidates: list[AssemblyRecord],
+    required_count: int,
+    seed: int,
+) -> None:
+    selected_ids = {record.assembly_id for record in selected}
+    current = sum(1 for record in selected if record.assembly_id in {candidate.assembly_id for candidate in candidates})
+    if current >= required_count:
+        return
+    for record in ranked_records(candidates, seed):
+        if record.assembly_id in selected_ids:
+            continue
+        selected.append(record)
+        selected_ids.add(record.assembly_id)
+        current += 1
+        if current >= required_count:
+            break
+
+
+def validate_floors(
+    records: list[AssemblyRecord],
+    selected: list[AssemblyRecord],
+    species_targets: list[str],
+    species_floor: int,
+    class_targets: list[str],
+    class_floor: int,
+) -> list[dict[str, object]]:
+    shortfalls: list[dict[str, object]] = []
+    for target in species_targets:
+        available = [record for record in records if matches_species_target(record, target)]
+        selected_count = sum(1 for record in selected if matches_species_target(record, target))
+        if len(available) < species_floor:
+            shortfalls.append(
+                {
+                    "kind": "species",
+                    "name": target,
+                    "required": species_floor,
+                    "available": len(available),
+                    "selected": selected_count,
+                }
+            )
+    for class_name in class_targets:
+        available = [record for record in records if class_name in record.classes]
+        selected_count = sum(1 for record in selected if class_name in record.classes)
+        if len(available) < class_floor:
+            shortfalls.append(
+                {
+                    "kind": "class",
+                    "name": class_name,
+                    "required": class_floor,
+                    "available": len(available),
+                    "selected": selected_count,
+                }
+            )
+    return shortfalls
+
+
+def select_records(args: argparse.Namespace, records: list[AssemblyRecord]) -> tuple[list[AssemblyRecord], dict[str, object]]:
+    if args.full_set:
+        selected = sorted(records, key=lambda record: (record.species, -record.richness_score, record.assembly_id))
+        return selected, {"selection_mode": "full_set", "target_size": len(selected)}
+
+    groups: dict[str, list[AssemblyRecord]] = collections.defaultdict(list)
+    for record in records:
+        groups[record.species].append(record)
+
+    quotas = allocate_quotas(groups, args.target_size, args.min_per_species, args.max_per_species)
+    selected: list[AssemblyRecord] = []
+    for species, quota in sorted(quotas.items()):
+        if quota <= 0:
+            continue
+        selected.extend(choose_within_species(groups[species], quota, stable_species_seed(args.seed, species)))
+
+    species_targets = split_csv(args.eskapee_species) if args.eskapee_species else []
+    class_targets = split_csv(args.antibiotic_classes) if args.antibiotic_classes else classes_in_records(records)
+
+    shortfalls = validate_floors(
+        records,
+        selected,
+        species_targets,
+        args.eskapee_floor,
+        class_targets,
+        args.class_floor,
+    )
+    if shortfalls:
+        raise SystemExit("Unsatisfied floor(s): " + "; ".join(
+            f"{item['kind']}={item['name']} required={item['required']} available={item['available']}"
+            for item in shortfalls
+        ))
+
+    for target in species_targets:
+        candidates = [record for record in records if matches_species_target(record, target)]
+        add_records_for_floor(selected, candidates, args.eskapee_floor, stable_species_seed(args.seed, target))
+
+    for class_name in class_targets:
+        candidates = [record for record in records if class_name in record.classes]
+        add_records_for_floor(selected, candidates, args.class_floor, stable_species_seed(args.seed, class_name))
+
+    deduped = {record.assembly_id: record for record in selected}
+    selected = sorted(deduped.values(), key=lambda record: (record.species, -record.richness_score, record.assembly_id))
+    return selected, {
+        "selection_mode": "stratified",
+        "target_size": args.target_size,
+        "species_quotas": quotas,
+        "eskapee_species": species_targets,
+        "eskapee_floor": args.eskapee_floor,
+        "antibiotic_classes": class_targets,
+        "class_floor": args.class_floor,
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Select AMR benchmark cohort")
+    parser.add_argument("--csv", type=Path, required=True)
+    parser.add_argument("--out-csv", type=Path, required=True)
+    parser.add_argument("--out-json", type=Path, required=True)
+    parser.add_argument("--target-size", type=int, default=2000)
+    parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--min-per-species", type=int, default=25)
+    parser.add_argument("--max-per-species", type=int, default=300)
+    parser.add_argument("--full-set", action="store_true", help="Use every assembly in the input CSV")
+    parser.add_argument("--eskapee-species", default=",".join(DEFAULT_ESKAPEE_TARGETS))
+    parser.add_argument("--eskapee-floor", type=int, default=300)
+    parser.add_argument("--antibiotic-classes", default="", help="Comma-separated class names; default is all classes in the CSV")
+    parser.add_argument("--class-floor", type=int, default=300)
+    args = parser.parse_args()
+
+    records = load_assembly_records(args.csv)
+    selected, summary = select_records(args, records)
+    selected_ids = {record.assembly_id for record in selected}
+    reserve = [
+        record
+        for record in sorted(records, key=lambda r: (r.species, -r.richness_score, r.assembly_id))
+        if record.assembly_id not in selected_ids
+    ][: max(200, args.target_size // 10)]
+
+    write_csv(
+        args.out_csv,
+        MANIFEST_COLUMNS,
+        (assembly_manifest_row(record, idx + 1) for idx, record in enumerate(selected)),
+    )
+
+    json_dump(
+        args.out_json,
+        {
+            **summary,
+            "input_assemblies": len(records),
+            "selected_size": len(selected),
+            "reserve_size": len(reserve),
+            "top_species_selected": collections.Counter(record.species for record in selected).most_common(20),
+            "class_counts_selected": collections.Counter(class_name for record in selected for class_name in record.classes).most_common(),
+            "reserve_assemblies": [
+                {
+                    "assembly_id": record.assembly_id,
+                    "species": record.species,
+                    "richness_score": record.richness_score,
+                }
+                for record in reserve
+            ],
+        },
+    )
+
+
+if __name__ == "__main__":
+    main()

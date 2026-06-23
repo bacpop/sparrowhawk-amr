@@ -1,13 +1,15 @@
-use crate::amrfinder_db::load_amrfinder_references;
+use crate::amrfinder_db::{ReferenceType, load_amrfinder_references};
 use crate::detect::DetectionResult;
 use crate::fasta::read_fasta;
-use crate::index::{AmrIndex, KmerAssignment};
+use crate::index::{AmrIndex, IndexAlphabet, ReportUnitKind};
 use crate::kmer::{DnaKmerIter, SplitKmerIter, decode_kmer};
 use anyhow::{Context, ensure};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
+
+// Helpers for debugging and analysing numbers of k-mers etc.
 
 #[derive(Debug, Clone)]
 pub struct DebugMissesConfig<'a> {
@@ -100,6 +102,10 @@ pub fn debug_amrfinder_misses(config: DebugMissesConfig<'_>) -> anyhow::Result<D
         config.refinement_k > 0 && config.refinement_k <= config.index.k,
         "refinement k must be between 1 and index k"
     );
+    ensure!(
+        config.index.alphabet == IndexAlphabet::Dna,
+        "AMRFinder miss debugging only supports DNA indexes"
+    );
 
     let assembly = read_fasta(config.assembly_path)?;
     let contigs: HashMap<String, Vec<u8>> = assembly
@@ -119,7 +125,7 @@ pub fn debug_amrfinder_misses(config: DebugMissesConfig<'_>) -> anyhow::Result<D
         .genes
         .iter()
         .enumerate()
-        .map(|(idx, gene)| (gene.protein_accession.as_str(), idx))
+        .map(|(idx, gene)| (config.index.string(gene.protein_accession), idx))
         .collect();
 
     let mut missed = Vec::new();
@@ -185,22 +191,23 @@ fn debug_row(
         split_matched,
     ) = if let Some(gene_id) = gene_id {
         let gene = &index.genes[gene_id];
-        let diagnostic: HashSet<u64> = index.gene_specific_kmers(gene_id).iter().copied().collect();
+        let unit_id = gene.report_unit_id as usize;
+        let diagnostic = index.unit_specific_kmers(unit_id);
         let matched: HashSet<u64> = diagnostic.intersection(&interval_kmers).copied().collect();
         let missing: Vec<u64> = diagnostic.difference(&interval_kmers).copied().collect();
-        let family_diagnostic = family_specific_kmers(index, &gene.family);
+        let family_diagnostic = hierarchy_unit_kmers(index, index.string(gene.gene_group));
         let family_matched = family_diagnostic.intersection(&interval_kmers).count();
         let lowk_target = refinement_target(&missing, index.k, refinement_k, false);
         let split_target = refinement_target(&missing, index.k, refinement_k, true);
         let interval_lowk = distinct_lowk(&interval, refinement_k);
         let interval_split = distinct_split(&interval, refinement_k);
         (
-            Some(gene.id.clone()),
-            Some(gene.element_symbol.clone()),
-            Some(gene.gene_symbol.clone()),
-            Some(gene.allele_symbol.clone()),
-            Some(gene.family.clone()),
-            Some(gene.hierarchy_node.clone()),
+            Some(index.string(gene.id).to_string()),
+            Some(index.string(gene.element_symbol).to_string()),
+            Some(index.string(gene.gene_symbol).to_string()),
+            Some(index.string(gene.allele_symbol).to_string()),
+            Some(index.string(gene.gene_group).to_string()),
+            Some(index.string(gene.hierarchy_node).to_string()),
             Some(gene.length),
             diagnostic.len(),
             matched.len(),
@@ -449,20 +456,14 @@ fn refinement_target(
     target
 }
 
-fn family_specific_kmers(index: &AmrIndex, family: &str) -> HashSet<u64> {
-    let Some(family_id) = index
-        .families
-        .iter()
-        .position(|indexed_family| indexed_family == family)
-    else {
+fn hierarchy_unit_kmers(index: &AmrIndex, hierarchy_node: &str) -> HashSet<u64> {
+    let Some(unit_id) = index.units.iter().position(|unit| {
+        unit.kind() == ReportUnitKind::HierarchyNode
+            && index.string(unit.hierarchy_node) == hierarchy_node
+    }) else {
         return HashSet::new();
     };
-    index
-        .kmer_codes
-        .iter()
-        .copied()
-        .filter(|&kmer| index.lookup(kmer) == Some(KmerAssignment::Family(family_id)))
-        .collect()
+    index.unit_specific_kmers(unit_id)
 }
 
 fn reference_kmers_by_accession(
@@ -470,7 +471,7 @@ fn reference_kmers_by_accession(
     k: usize,
 ) -> anyhow::Result<HashMap<String, HashSet<u64>>> {
     let mut by_accession = HashMap::<String, HashSet<u64>>::new();
-    for reference in load_amrfinder_references(db_dir)? {
+    for reference in load_amrfinder_references(db_dir, &[ReferenceType::Amr])? {
         by_accession
             .entry(reference.protein_accession)
             .or_default()

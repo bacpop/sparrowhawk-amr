@@ -14,6 +14,7 @@ pub fn read_fasta(path: &Path) -> anyhow::Result<Vec<FastaRecord>> {
     parse_fasta_bytes(&bytes)
 }
 
+// very simple parser, probably could do something to support compressed things like the things we've got in sketchlib or sphk-asm
 pub fn parse_fasta_bytes(bytes: &[u8]) -> anyhow::Result<Vec<FastaRecord>> {
     let text = std::str::from_utf8(bytes).context("FASTA is not valid UTF-8")?;
     let mut records = Vec::new();
@@ -58,6 +59,8 @@ pub fn parse_fasta_bytes(bytes: &[u8]) -> anyhow::Result<Vec<FastaRecord>> {
     Ok(records)
 }
 
+
+// =================== TEST
 #[cfg(test)]
 mod tests {
     use super::*;

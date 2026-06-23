@@ -2,3 +2,16 @@
 /data
 /evaluation
 __pycache__/
+# Benchmark generated data
+/benchmark/.venv
+/benchmark/__pycache__/
+/benchmark/src/**/__pycache__/
+/benchmark/data/
+/benchmark/fasta/
+/benchmark/manifests/
+/benchmark/detector/
+/benchmark/native_amrfinder*/
+/benchmark/comparisons/
+/benchmark/failure_analysis/
+/benchmark/index_stats_*.txt
+/benchmark/index_size_*.txt

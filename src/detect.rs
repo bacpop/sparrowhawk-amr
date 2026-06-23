@@ -1,6 +1,7 @@
 use crate::fasta::parse_fasta_bytes;
-use crate::index::{AmrIndex, KmerAssignment};
-use crate::kmer::{DnaKmerIter, SplitKmerIter, decode_kmer};
+use crate::index::{AmrIndex, IndexAlphabet, ReportUnit, ReportUnitKind};
+use crate::kmer::{DnaKmerIter, ProteinKmerIter};
+use anyhow::ensure;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -8,8 +9,11 @@ use std::collections::{HashMap, HashSet};
 pub enum QueryKind {
     Direct,
     Cds,
+    ProteinCds,
 }
 
+/// TEST This temporary enum was done for doing tests and seeing if getting lower k-vals
+/// after first matches, or using split k-mers might help refine the results
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RefinementMode {
     None,
@@ -30,7 +34,8 @@ impl std::fmt::Display for RefinementMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectParams {
     pub min_gene_fraction: f64,
-    pub min_family_fraction: f64,
+    #[serde(alias = "min_gene_group_fraction")]
+    pub min_gene_group_fraction: f64,
     pub seed_gene_fraction: f64,
     pub seed_gene_hits: usize,
     pub refinement_mode: RefinementMode,
@@ -41,7 +46,7 @@ impl Default for DetectParams {
     fn default() -> Self {
         Self {
             min_gene_fraction: 0.10,
-            min_family_fraction: 0.10,
+            min_gene_group_fraction: 0.10,
             seed_gene_fraction: 0.01,
             seed_gene_hits: 3,
             refinement_mode: RefinementMode::None,
@@ -54,13 +59,20 @@ impl Default for DetectParams {
 pub struct DetectionHit {
     pub query_id: String,
     pub query_kind: QueryKind,
+    pub unit_id: String,
+    pub unit_label: String,
     pub gene_id: Option<String>,
     pub element_symbol: Option<String>,
     pub gene_symbol: Option<String>,
     pub allele_symbol: Option<String>,
-    pub family: String,
+    #[serde(alias = "family")]
+    pub gene_group: String,
+    pub hierarchy_node: Option<String>,
     pub class_name: Option<String>,
     pub subclass: Option<String>,
+    pub type_name: Option<String>,
+    pub subtype: Option<String>,
+    pub member_count: usize,
     pub start: usize,
     pub end: usize,
     pub call_stage: String,
@@ -81,12 +93,14 @@ pub struct DetectionResult {
     pub sample_name: String,
     pub database_version: String,
     pub query_kind: QueryKind,
+    #[serde(default)]
+    pub index_alphabet: IndexAlphabet,
     pub index_k: usize,
     pub refinement_mode: RefinementMode,
     pub refinement_k: usize,
     pub hits: Vec<DetectionHit>,
     pub gene_count: usize,
-    pub family_count: usize,
+    pub gene_group_count: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -118,268 +132,198 @@ pub fn detect_fasta(
     query_kind: QueryKind,
     params: &DetectParams,
 ) -> anyhow::Result<DetectionResult> {
+    ensure!(
+        index.alphabet == expected_alphabet(query_kind),
+        "{} index cannot be used for {:?} detection",
+        index.alphabet.as_str(),
+        query_kind
+    );
     let records = parse_fasta_bytes(fasta_bytes)?;
     let mut hits = Vec::new();
 
     for record in records {
-        let mut gene_hits = HashMap::<usize, HitAccumulator>::new();
-        let mut family_hits = HashMap::<usize, HitAccumulator>::new();
+        let mut unit_hits = HashMap::<usize, HitAccumulator>::new();
 
-        if let Some(iter) = DnaKmerIter::new(&record.seq, index.k) {
-            for (pos, kmer) in iter {
-                match index.lookup(kmer) {
-                    Some(KmerAssignment::Gene(gene_id)) => {
-                        gene_hits
-                            .entry(gene_id)
-                            .or_default()
-                            .add(kmer, pos, index.k);
+        match index.alphabet {
+            IndexAlphabet::Dna => {
+                if let Some(iter) = DnaKmerIter::new(&record.seq, index.k) {
+                    for (pos, kmer) in iter {
+                        if let Some(unit_id) = index.lookup(kmer) {
+                            unit_hits
+                                .entry(unit_id)
+                                .or_default()
+                                .add(kmer, pos, index.k);
+                        }
                     }
-                    Some(KmerAssignment::Family(family_id)) => {
-                        family_hits
-                            .entry(family_id)
-                            .or_default()
-                            .add(kmer, pos, index.k);
+                }
+            }
+            IndexAlphabet::Protein => {
+                if let Some(iter) = ProteinKmerIter::new(&record.seq, index.k) {
+                    for (pos, kmer) in iter {
+                        if let Some(unit_id) = index.lookup(kmer) {
+                            unit_hits
+                                .entry(unit_id)
+                                .or_default()
+                                .add(kmer, pos, index.k);
+                        }
                     }
-                    None => {}
                 }
             }
         }
 
-        let mut called_genes = HashSet::<usize>::new();
-        let mut claimed_families = HashSet::<String>::new();
-        for (&gene_id, acc) in &gene_hits {
-            let gene = &index.genes[gene_id];
-            if gene.gene_specific_kmers == 0 {
+        let mut suppressed_hierarchy_units = HashSet::<usize>::new();
+        for (&unit_id, acc) in &unit_hits {
+            let unit = &index.units[unit_id];
+            if unit.kind() != ReportUnitKind::ExactGene || unit.diagnostic_kmers == 0 {
                 continue;
             }
-            let fraction = acc.distinct.len() as f64 / gene.gene_specific_kmers as f64;
+            let fraction = acc.distinct.len() as f64 / unit.diagnostic_kmers as f64;
             if fraction < params.min_gene_fraction {
                 continue;
             }
-            called_genes.insert(gene_id);
-            claimed_families.insert(gene.family.clone());
-            hits.push(gene_hit(
-                index, gene_id, &record.id, query_kind, acc, "k31", 0, 0, 0, 0.0, fraction,
+            suppressed_hierarchy_units.extend(
+                unit.ancestor_unit_ids
+                    .iter()
+                    .map(|&ancestor_id| ancestor_id as usize),
+            );
+            hits.push(unit_hit(
+                index, unit, &record.id, query_kind, index.k, acc, fraction,
             ));
         }
 
-        if params.refinement_mode != RefinementMode::None {
-            for (&gene_id, acc) in &gene_hits {
-                if called_genes.contains(&gene_id) {
-                    continue;
+        let mut hierarchy_candidates: Vec<(usize, &HitAccumulator, f64)> = unit_hits
+            .iter()
+            .filter_map(|(&unit_id, acc)| {
+                let unit = &index.units[unit_id];
+                if unit.kind() != ReportUnitKind::HierarchyNode || unit.diagnostic_kmers == 0 {
+                    return None;
                 }
-                let gene = &index.genes[gene_id];
-                if gene.gene_specific_kmers == 0 {
-                    continue;
-                }
-                let first_fraction = acc.distinct.len() as f64 / gene.gene_specific_kmers as f64;
-                if acc.distinct.len() < params.seed_gene_hits
-                    && first_fraction < params.seed_gene_fraction
-                {
-                    continue;
-                }
-                let Some(refined) = refine_gene(index, gene_id, &record.seq, &acc.distinct, params)
-                else {
-                    continue;
-                };
-                if refined.diagnostic_total == 0 {
-                    continue;
-                }
-                let refinement_fraction =
-                    refined.distinct.len() as f64 / refined.diagnostic_total as f64;
-                if refinement_fraction < params.min_gene_fraction {
-                    continue;
-                }
-                called_genes.insert(gene_id);
-                claimed_families.insert(gene.family.clone());
-                hits.push(gene_hit(
-                    index,
-                    gene_id,
-                    &record.id,
-                    query_kind,
-                    acc,
-                    &params.refinement_mode.to_string(),
-                    refined.distinct.len(),
-                    refined.count,
-                    refined.diagnostic_total,
-                    refinement_fraction,
-                    refinement_fraction.max(first_fraction),
-                ));
-            }
-        }
+                let fraction = acc.distinct.len() as f64 / unit.diagnostic_kmers as f64;
+                (fraction >= params.min_gene_group_fraction).then_some((unit_id, acc, fraction))
+            })
+            .collect();
+        hierarchy_candidates.sort_by_key(|(unit_id, _, _)| index.units[*unit_id].member_count);
 
-        for (&family_id, acc) in &family_hits {
-            let family = &index.families[family_id];
-            let diagnostic_total = index.family_specific_kmers[family_id];
-            if diagnostic_total == 0 || claimed_families.contains(family) {
+        for (unit_id, acc, fraction) in hierarchy_candidates {
+            if suppressed_hierarchy_units.contains(&unit_id) {
                 continue;
             }
-            let fraction = acc.distinct.len() as f64 / diagnostic_total as f64;
-            if fraction < params.min_family_fraction {
-                continue;
-            }
-            hits.push(DetectionHit {
-                query_id: record.id.clone(),
-                query_kind,
-                gene_id: None,
-                element_symbol: None,
-                gene_symbol: None,
-                allele_symbol: None,
-                family: family.clone(),
-                class_name: None,
-                subclass: None,
-                start: acc.min_pos,
-                end: acc.max_pos,
-                call_stage: "k31".to_string(),
-                first_pass_distinct: acc.distinct.len(),
-                first_pass_total: acc.count,
-                first_pass_diagnostic_total: diagnostic_total,
-                first_pass_fraction: fraction,
-                refinement_distinct: 0,
-                refinement_total: 0,
-                refinement_diagnostic_total: 0,
-                refinement_fraction: 0.0,
-                call_fraction: fraction,
-                call_type: "family".to_string(),
-            });
+            let unit = &index.units[unit_id];
+            suppressed_hierarchy_units.extend(
+                unit.ancestor_unit_ids
+                    .iter()
+                    .map(|&ancestor_id| ancestor_id as usize),
+            );
+            hits.push(unit_hit(
+                index, unit, &record.id, query_kind, index.k, acc, fraction,
+            ));
         }
     }
 
     let gene_count = hits.iter().filter(|hit| hit.call_type == "gene").count();
-    let family_count = hits.iter().filter(|hit| hit.call_type == "family").count();
+    let gene_group_count = hits
+        .iter()
+        .filter(|hit| hit.call_type == "gene_group")
+        .count();
     Ok(DetectionResult {
         sample_name: sample_name.to_string(),
         database_version: index.db_version.clone(),
         query_kind,
+        index_alphabet: index.alphabet,
         index_k: index.k,
         refinement_mode: params.refinement_mode,
         refinement_k: params.refinement_k,
         hits,
         gene_count,
-        family_count,
+        gene_group_count,
     })
 }
 
-fn gene_hit(
+pub fn detect_protein_fasta(
     index: &AmrIndex,
-    gene_id: usize,
+    fasta_bytes: &[u8],
+    sample_name: &str,
+    params: &DetectParams,
+) -> anyhow::Result<DetectionResult> {
+    detect_fasta(
+        index,
+        fasta_bytes,
+        sample_name,
+        QueryKind::ProteinCds,
+        params,
+    )
+}
+
+fn expected_alphabet(query_kind: QueryKind) -> IndexAlphabet {
+    match query_kind {
+        QueryKind::Direct | QueryKind::Cds => IndexAlphabet::Dna,
+        QueryKind::ProteinCds => IndexAlphabet::Protein,
+    }
+}
+
+
+// Recover all the info, including metadata, from the index
+fn unit_hit(
+    index: &AmrIndex,
+    unit: &ReportUnit,
     query_id: &str,
     query_kind: QueryKind,
+    k: usize,
     acc: &HitAccumulator,
-    stage: &str,
-    refinement_distinct: usize,
-    refinement_total: usize,
-    refinement_diagnostic_total: usize,
-    refinement_fraction: f64,
     call_fraction: f64,
 ) -> DetectionHit {
-    let gene = &index.genes[gene_id];
-    let first_fraction = if gene.gene_specific_kmers == 0 {
+    let first_fraction = if unit.diagnostic_kmers == 0 {
         0.0
     } else {
-        acc.distinct.len() as f64 / gene.gene_specific_kmers as f64
+        acc.distinct.len() as f64 / unit.diagnostic_kmers as f64
     };
+
     DetectionHit {
         query_id: query_id.to_string(),
         query_kind,
-        gene_id: Some(gene.id.clone()),
-        element_symbol: Some(gene.element_symbol.clone()),
-        gene_symbol: Some(gene.gene_symbol.clone()),
-        allele_symbol: Some(gene.allele_symbol.clone()),
-        family: gene.family.clone(),
-        class_name: Some(gene.class_name.clone()),
-        subclass: Some(gene.subclass.clone()),
+        unit_id: index.string(unit.id).to_string(),
+        unit_label: index.string(unit.label).to_string(),
+        gene_id: unit.gene_id.map(|_| index.string(unit.id).to_string()),
+        element_symbol: index.optional_string(unit.element_symbol),
+        gene_symbol: index.optional_string(unit.gene_symbol),
+        allele_symbol: index.optional_string(unit.allele_symbol),
+        gene_group: index.string(unit.gene_group).to_string(),
+        hierarchy_node: non_empty_option(index.string(unit.hierarchy_node)),
+        class_name: non_empty_option(index.string(unit.class_name)),
+        subclass: non_empty_option(index.string(unit.subclass)),
+        type_name: non_empty_option(index.string(unit.type_name)),
+        subtype: non_empty_option(index.string(unit.subtype)),
+        member_count: unit.member_count,
         start: acc.min_pos,
         end: acc.max_pos,
-        call_stage: stage.to_string(),
+        call_stage: format!("k{k}"),
         first_pass_distinct: acc.distinct.len(),
         first_pass_total: acc.count,
-        first_pass_diagnostic_total: gene.gene_specific_kmers,
+        first_pass_diagnostic_total: unit.diagnostic_kmers,
         first_pass_fraction: first_fraction,
-        refinement_distinct,
-        refinement_total,
-        refinement_diagnostic_total,
-        refinement_fraction,
+        refinement_distinct: 0,
+        refinement_total: 0,
+        refinement_diagnostic_total: 0,
+        refinement_fraction: 0.0,
         call_fraction,
-        call_type: "gene".to_string(),
+        call_type: unit.call_type().to_string(),
     }
 }
 
-#[derive(Debug)]
-struct RefinementAccumulator {
-    count: usize,
-    distinct: HashSet<u64>,
-    diagnostic_total: usize,
+fn non_empty_option(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_string())
 }
 
-fn refine_gene(
-    index: &AmrIndex,
-    gene_id: usize,
-    query_seq: &[u8],
-    matched_first_pass: &HashSet<u64>,
-    params: &DetectParams,
-) -> Option<RefinementAccumulator> {
-    let mut target = HashSet::<u64>::new();
-    for &kmer in index.gene_specific_kmers(gene_id) {
-        if matched_first_pass.contains(&kmer) {
-            continue;
-        }
-        let decoded = decode_kmer(kmer, index.k);
-        match params.refinement_mode {
-            RefinementMode::None => {}
-            RefinementMode::Split => {
-                if let Some(iter) = SplitKmerIter::new(&decoded, params.refinement_k) {
-                    target.extend(iter.map(|(_, code)| code));
-                }
-            }
-            RefinementMode::LowK => {
-                if let Some(iter) = DnaKmerIter::new(&decoded, params.refinement_k) {
-                    target.extend(iter.map(|(_, code)| code));
-                }
-            }
-        }
-    }
-    if target.is_empty() {
-        return None;
-    }
 
-    let mut distinct = HashSet::new();
-    let mut count = 0usize;
-    match params.refinement_mode {
-        RefinementMode::None => {}
-        RefinementMode::Split => {
-            if let Some(iter) = SplitKmerIter::new(query_seq, params.refinement_k) {
-                for (_pos, code) in iter {
-                    if target.contains(&code) {
-                        count += 1;
-                        distinct.insert(code);
-                    }
-                }
-            }
-        }
-        RefinementMode::LowK => {
-            if let Some(iter) = DnaKmerIter::new(query_seq, params.refinement_k) {
-                for (_pos, code) in iter {
-                    if target.contains(&code) {
-                        count += 1;
-                        distinct.insert(code);
-                    }
-                }
-            }
-        }
-    }
 
-    Some(RefinementAccumulator {
-        count,
-        distinct,
-        diagnostic_total: target.len(),
-    })
-}
+
+
+// =============================== TESTS
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::amrfinder_db::AmrReference;
+    use crate::amrfinder_db::{AmrReference, HierarchyNode};
     use crate::index::{IndexBuildConfig, build_index};
 
     #[test]
@@ -399,10 +343,30 @@ mod tests {
             type_name: "AMR".to_string(),
             subtype: "AMR".to_string(),
             reportable: 2,
+            hierarchy_path: vec![HierarchyNode {
+                node_id: "node".to_string(),
+                parent_node_id: String::new(),
+                symbol: "node".to_string(),
+                class_name: "CLASS".to_string(),
+                subclass: "SUB".to_string(),
+                scope: "core".to_string(),
+                type_name: "AMR".to_string(),
+                subtype: "AMR".to_string(),
+                reportable: 2,
+            }],
             db_version: "test".to_string(),
             seq: b"ACGTACGTACGT".to_vec(),
         }];
-        let index = build_index(&refs, &IndexBuildConfig { k: 5 }).unwrap();
+        let index = build_index(
+            &refs,
+            &IndexBuildConfig {
+                alphabet: IndexAlphabet::Dna,
+                k: 5,
+                min_exact_gene_kmers: 0,
+                min_hierarchy_unit_kmers: 1,
+            },
+        )
+        .unwrap();
         let params = DetectParams {
             min_gene_fraction: 0.5,
             ..DetectParams::default()
@@ -416,5 +380,223 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.gene_count, 1);
+        assert_eq!(result.hits[0].type_name.as_deref(), Some("AMR"));
+        assert_eq!(result.hits[0].subtype.as_deref(), Some("AMR"));
+    }
+
+    #[test]
+    fn detects_cds_query_kind_against_dna_index() {
+        let refs = vec![AmrReference {
+            protein_accession: "p1".to_string(),
+            nucleotide_accession: "n1".to_string(),
+            element_symbol: "geneA".to_string(),
+            gene_symbol: "geneA".to_string(),
+            allele_symbol: "geneA".to_string(),
+            product: String::new(),
+            family: "famA".to_string(),
+            class_name: "CLASS".to_string(),
+            subclass: "SUB".to_string(),
+            hierarchy_node: "node".to_string(),
+            scope: "core".to_string(),
+            type_name: "AMR".to_string(),
+            subtype: "AMR".to_string(),
+            reportable: 2,
+            hierarchy_path: vec![HierarchyNode {
+                node_id: "node".to_string(),
+                parent_node_id: String::new(),
+                symbol: "node".to_string(),
+                class_name: "CLASS".to_string(),
+                subclass: "SUB".to_string(),
+                scope: "core".to_string(),
+                type_name: "AMR".to_string(),
+                subtype: "AMR".to_string(),
+                reportable: 2,
+            }],
+            db_version: "test".to_string(),
+            seq: b"ACGTACGTACGT".to_vec(),
+        }];
+        let index = build_index(
+            &refs,
+            &IndexBuildConfig {
+                alphabet: IndexAlphabet::Dna,
+                k: 5,
+                min_exact_gene_kmers: 0,
+                min_hierarchy_unit_kmers: 1,
+            },
+        )
+        .unwrap();
+        let result = detect_fasta(
+            &index,
+            b">gene_1
+ACGTACGTACGT
+",
+            "sample",
+            QueryKind::Cds,
+            &DetectParams {
+                min_gene_fraction: 0.5,
+                ..DetectParams::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(result.query_kind, QueryKind::Cds);
+        assert_eq!(result.hits[0].query_id, "gene_1");
+    }
+
+    #[test]
+    fn rejects_protein_query_against_dna_index() {
+        let refs = vec![AmrReference {
+            protein_accession: "p1".to_string(),
+            nucleotide_accession: "n1".to_string(),
+            element_symbol: "geneA".to_string(),
+            gene_symbol: "geneA".to_string(),
+            allele_symbol: "geneA".to_string(),
+            product: String::new(),
+            family: "famA".to_string(),
+            class_name: "CLASS".to_string(),
+            subclass: "SUB".to_string(),
+            hierarchy_node: "node".to_string(),
+            scope: "core".to_string(),
+            type_name: "AMR".to_string(),
+            subtype: "AMR".to_string(),
+            reportable: 2,
+            hierarchy_path: vec![HierarchyNode {
+                node_id: "node".to_string(),
+                parent_node_id: String::new(),
+                symbol: "node".to_string(),
+                class_name: "CLASS".to_string(),
+                subclass: "SUB".to_string(),
+                scope: "core".to_string(),
+                type_name: "AMR".to_string(),
+                subtype: "AMR".to_string(),
+                reportable: 2,
+            }],
+            db_version: "test".to_string(),
+            seq: b"ACGTACGTACGT".to_vec(),
+        }];
+        let index = build_index(
+            &refs,
+            &IndexBuildConfig {
+                alphabet: IndexAlphabet::Dna,
+                k: 5,
+                min_exact_gene_kmers: 0,
+                min_hierarchy_unit_kmers: 1,
+            },
+        )
+        .unwrap();
+        let err = detect_protein_fasta(
+            &index,
+            b">protein\nMKTAA\n",
+            "sample",
+            &DetectParams::default(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("dna index"));
+    }
+
+    #[test]
+    fn detects_simple_protein_gene() {
+        let refs = vec![AmrReference {
+            protein_accession: "p1".to_string(),
+            nucleotide_accession: "n1".to_string(),
+            element_symbol: "geneA".to_string(),
+            gene_symbol: "geneA".to_string(),
+            allele_symbol: "geneA".to_string(),
+            product: String::new(),
+            family: "famA".to_string(),
+            class_name: "CLASS".to_string(),
+            subclass: "SUB".to_string(),
+            hierarchy_node: "node".to_string(),
+            scope: "core".to_string(),
+            type_name: "AMR".to_string(),
+            subtype: "AMR".to_string(),
+            reportable: 2,
+            hierarchy_path: vec![HierarchyNode {
+                node_id: "node".to_string(),
+                parent_node_id: String::new(),
+                symbol: "node".to_string(),
+                class_name: "CLASS".to_string(),
+                subclass: "SUB".to_string(),
+                scope: "core".to_string(),
+                type_name: "AMR".to_string(),
+                subtype: "AMR".to_string(),
+                reportable: 2,
+            }],
+            db_version: "test".to_string(),
+            seq: b"MKTAA".to_vec(),
+        }];
+        let index = build_index(
+            &refs,
+            &IndexBuildConfig {
+                alphabet: IndexAlphabet::Protein,
+                k: 3,
+                min_exact_gene_kmers: 0,
+                min_hierarchy_unit_kmers: 1,
+            },
+        )
+        .unwrap();
+        let result = detect_protein_fasta(
+            &index,
+            b">protein\nXXMKTAA\n",
+            "sample",
+            &DetectParams {
+                min_gene_fraction: 0.5,
+                ..DetectParams::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(result.index_alphabet, IndexAlphabet::Protein);
+        assert_eq!(result.gene_count, 1);
+    }
+
+    #[test]
+    fn rejects_direct_query_against_protein_index() {
+        let refs = vec![AmrReference {
+            protein_accession: "p1".to_string(),
+            nucleotide_accession: "n1".to_string(),
+            element_symbol: "geneA".to_string(),
+            gene_symbol: "geneA".to_string(),
+            allele_symbol: "geneA".to_string(),
+            product: String::new(),
+            family: "famA".to_string(),
+            class_name: "CLASS".to_string(),
+            subclass: "SUB".to_string(),
+            hierarchy_node: "node".to_string(),
+            scope: "core".to_string(),
+            type_name: "AMR".to_string(),
+            subtype: "AMR".to_string(),
+            reportable: 2,
+            hierarchy_path: vec![HierarchyNode {
+                node_id: "node".to_string(),
+                parent_node_id: String::new(),
+                symbol: "node".to_string(),
+                class_name: "CLASS".to_string(),
+                subclass: "SUB".to_string(),
+                scope: "core".to_string(),
+                type_name: "AMR".to_string(),
+                subtype: "AMR".to_string(),
+                reportable: 2,
+            }],
+            db_version: "test".to_string(),
+            seq: b"MKTAA".to_vec(),
+        }];
+        let index = build_index(
+            &refs,
+            &IndexBuildConfig {
+                alphabet: IndexAlphabet::Protein,
+                k: 3,
+                min_exact_gene_kmers: 0,
+                min_hierarchy_unit_kmers: 1,
+            },
+        )
+        .unwrap();
+        let err = detect_fasta(
+            &index,
+            b">contig\nATGAAAACCGCC\n",
+            "sample",
+            QueryKind::Direct,
+            &DetectParams::default(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("protein index"));
     }
 }

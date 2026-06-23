@@ -1,4 +1,5 @@
 use crate::fasta::{FastaRecord, read_fasta};
+use crate::translate::{DEFAULT_BACTERIAL_TRANSLATION_TABLE, translate_cds};
 use anyhow::{Context, ensure};
 use bio::bio_types::strand::Strand;
 use orphos_core::config::{OrphosConfig, OutputFormat};
@@ -13,6 +14,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const MIN_NT_CONTIG: usize = 96;
+
+// Set of helpers mostly from what we had done with orphos-bridge for checking the difference with calling first the genes, then identifying AMR in them
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GeneCaller {
@@ -79,8 +82,7 @@ pub fn run_orphos_gene_caller(
     let results = call_orphos(&records, config)?;
     write_gff(&gff, &results)?;
     write_cds_fasta(&cds, &records, &results)?;
-    fs::write(&proteins, b"")
-        .with_context(|| format!("write protein placeholder {}", proteins.display()))?;
+    write_protein_fasta(&proteins, &records, &results, config.translation_table)?;
 
     Ok(GeneCallerOutput {
         caller: GeneCaller::Orphos,
@@ -226,6 +228,53 @@ fn write_cds_fasta(
     fs::write(path, out).with_context(|| format!("write {}", path.display()))
 }
 
+fn write_protein_fasta(
+    path: &Path,
+    records: &[FastaRecord],
+    results: &[OrphosResults],
+    translation_table: Option<u8>,
+) -> anyhow::Result<()> {
+    let table = translation_table.unwrap_or(DEFAULT_BACTERIAL_TRANSLATION_TABLE);
+    let sequence_by_id: HashMap<&str, &[u8]> = records
+        .iter()
+        .map(|record| (record.id.as_str(), record.seq.as_slice()))
+        .collect();
+    let mut out = Vec::<u8>::new();
+    for result in results {
+        let Some(seq) = sequence_by_id
+            .get(result.sequence_info.header.as_str())
+            .copied()
+        else {
+            continue;
+        };
+        for (idx, gene) in result.genes.iter().enumerate() {
+            if let Some(cds) = extract_cds(
+                seq,
+                gene.coordinates.begin,
+                gene.coordinates.end,
+                gene.coordinates.strand,
+            ) {
+                let protein = translate_cds(&cds, table);
+                if protein.is_empty() {
+                    continue;
+                }
+                let strand = strand_symbol(gene.coordinates.strand);
+                writeln!(
+                    out,
+                    ">{}_{}_{}..{}_{}",
+                    result.sequence_info.header,
+                    idx + 1,
+                    gene.coordinates.begin,
+                    gene.coordinates.end,
+                    strand
+                )?;
+                write_wrapped_fasta_seq(&mut out, &protein)?;
+            }
+        }
+    }
+    fs::write(path, out).with_context(|| format!("write {}", path.display()))
+}
+
 fn extract_cds(seq: &[u8], begin: usize, end: usize, strand: Strand) -> Option<Vec<u8>> {
     if begin == 0 || end < begin || end > seq.len() {
         return None;
@@ -266,6 +315,8 @@ fn write_wrapped_fasta_seq(out: &mut Vec<u8>, seq: &[u8]) -> anyhow::Result<()> 
     Ok(())
 }
 
+// ====================================== TESTs
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,6 +331,24 @@ mod tests {
     fn extracts_reverse_cds_as_reverse_complement() {
         let cds = extract_cds(b"AACCGGTT", 2, 5, Strand::Reverse).unwrap();
         assert_eq!(cds, b"CGGT");
+    }
+
+    #[test]
+    fn translates_extracted_forward_cds_without_terminal_stop() {
+        let cds = extract_cds(b"ATGGCTTAA", 1, 9, Strand::Forward).unwrap();
+        assert_eq!(
+            translate_cds(&cds, DEFAULT_BACTERIAL_TRANSLATION_TABLE),
+            b"MA"
+        );
+    }
+
+    #[test]
+    fn translates_extracted_reverse_cds_without_terminal_stop() {
+        let cds = extract_cds(b"TTAAGCCAT", 1, 9, Strand::Reverse).unwrap();
+        assert_eq!(
+            translate_cds(&cds, DEFAULT_BACTERIAL_TRANSLATION_TABLE),
+            b"MA"
+        );
     }
 
     #[test]
