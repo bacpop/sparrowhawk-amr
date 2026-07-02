@@ -245,12 +245,6 @@ def select_records(args: argparse.Namespace, records: list[AssemblyRecord]) -> t
         class_targets,
         args.class_floor,
     )
-    for item in shortfalls:
-        print(
-            "Warning: unsatisfied floor "
-            f"{item['kind']}={item['name']} required={item['required']} available={item['available']} selected={item['selected']}",
-            file=sys.stderr,
-        )
 
     for target in species_targets:
         candidates = [record for record in records if matches_species_target(record, target)]
@@ -262,6 +256,18 @@ def select_records(args: argparse.Namespace, records: list[AssemblyRecord]) -> t
 
     deduped = {record.assembly_id: record for record in selected}
     selected = sorted(deduped.values(), key=lambda record: (record.species, -record.richness_score, record.assembly_id))
+    for item in shortfalls:
+        if item["kind"] == "species":
+            selected_count = sum(1 for record in selected if matches_species_target(record, str(item["name"])))
+        else:
+            selected_count = sum(1 for record in selected if str(item["name"]) in record.classes)
+        item["selected"] = selected_count
+        print(
+            "Warning: unsatisfied floor "
+            f"{item['kind']}={item['name']} required={item['required']} available={item['available']}; "
+            f"selected_after_floor={selected_count}. Selecting all available entries.",
+            file=sys.stderr,
+        )
     return selected, {
         "selection_mode": "stratified",
         "target_size": args.target_size,
