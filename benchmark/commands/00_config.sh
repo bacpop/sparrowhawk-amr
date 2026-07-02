@@ -46,8 +46,44 @@ PROTEIN_MIN_HIERARCHY_UNIT_KMERS="${PROTEIN_MIN_HIERARCHY_UNIT_KMERS:-5}"
 
 DETECTOR_OUT="${DETECTOR_OUT:-$RUN/detector}"
 NATIVE_OUT="${NATIVE_OUT:-$RUN/native_amrfinder_plus}"
+NATIVE_EFFECTIVE_OUT="${NATIVE_EFFECTIVE_OUT:-}"
+NATIVE_AMRFINDER_VERSION="${NATIVE_AMRFINDER_VERSION:-}"
+NATIVE_DB_VERSION="${NATIVE_DB_VERSION:-}"
 COMPARISON_OUT="${COMPARISON_OUT:-$RUN/comparisons}"
 FAILURE_OUT="${FAILURE_OUT:-$RUN/failure_analysis}"
+
+safe_path_component() {
+  local value="$1"
+  value="$(printf '%s' "$value" | tr -cs '[:alnum:]._:-' '_')"
+  value="${value##_}"
+  value="${value%%_}"
+  printf '%s\n' "${value:-unknown}"
+}
+
+first_existing_line() {
+  local path
+  for path in "$@"; do
+    if [[ -s "$path" ]]; then
+      head -n 1 "$path"
+      return
+    fi
+  done
+  printf '%s\n' "unknown"
+}
+
+compute_native_effective_out() {
+  local requested_out="$NATIVE_EFFECTIVE_OUT"
+  local amrfinder_version
+  local db_version
+  amrfinder_version="$("$AMRFINDER_BIN" --version 2>&1 | head -n 1 || true)"
+  db_version="$(first_existing_line "$DB/version.txt" "$DB/database_format_version.txt")"
+  NATIVE_AMRFINDER_VERSION="$amrfinder_version"
+  NATIVE_DB_VERSION="$db_version"
+  if [[ -z "$requested_out" ]]; then
+    NATIVE_EFFECTIVE_OUT="$NATIVE_OUT/amrfinder_$(safe_path_component "$amrfinder_version")__db_$(safe_path_component "$db_version")"
+  fi
+  export NATIVE_EFFECTIVE_OUT NATIVE_AMRFINDER_VERSION NATIVE_DB_VERSION
+}
 
 # Selection defaults. Set FULL_SET=1 to evaluate every assembly in AMR_RECORDS.
 FULL_SET="${FULL_SET:-0}"

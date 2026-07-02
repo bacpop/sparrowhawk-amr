@@ -29,6 +29,8 @@ The input CSV is bundled by default at `benchmark/data/amr_records.csv`, and `AM
 
 Important roots are independent: `FASTA_DIR`, `DETECTOR_OUT`, `NATIVE_OUT`, `COMPARISON_OUT`, and `FAILURE_OUT` can all point outside the code checkout.
 
+`NATIVE_OUT` is a cache root. Native AMRFinderPlus outputs are written under a versioned subfolder named from the AMRFinderPlus executable version and the database version, for example `amrfinder_4.0.23__db_2026-06-30.1`. You can set `NATIVE_EFFECTIVE_OUT` for an explicit expert override, but ordinary runs should only set `NATIVE_OUT`.
+
 The benchmark scripts derive their own benchmark directory from the command location; there is no need to export `BENCHMARK_ROOT`. They do not compile Rust code, so `DETECTOR_BIN` must point to an existing executable.
 
 ## Selection

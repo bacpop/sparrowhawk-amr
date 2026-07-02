@@ -6,7 +6,8 @@
 set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/00_config.sh"
 
-NATIVE_STATUS="$NATIVE_OUT/amrfinder_status.csv"
+compute_native_effective_out
+NATIVE_STATUS="$NATIVE_EFFECTIVE_OUT/amrfinder_status.csv"
 HIERARCHY="$DB/ReferenceGeneHierarchy.txt"
 REPORT_MAP_ROOT="$DETECTOR_OUT/report_maps"
 
@@ -18,6 +19,8 @@ fi
 
 if [[ ! -f "$NATIVE_STATUS" ]]; then
   echo "Missing native AMRFinderPlus status CSV: $NATIVE_STATUS" >&2
+  echo "Native AMRFinderPlus cache root: $NATIVE_OUT" >&2
+  echo "Native AMRFinderPlus effective output: $NATIVE_EFFECTIVE_OUT" >&2
   echo "Run 02_run_detectors_and_native_plus.sh first." >&2
   exit 1
 fi
