@@ -66,6 +66,15 @@ uv --directory "$BENCHMARK_DIR" run amr-analyze-failures \
   --hierarchy "$HIERARCHY" \
   --out-dir "$FAILURE_OUT"
 
+echo "Creating plots..."
+uv --directory "$BENCHMARK_DIR" run amr-plot-results \
+  --aggregate-metrics "$COMPARISON_OUT/aggregate_metrics.csv" \
+  --selected-manifest "$SELECTED_MANIFEST" \
+  --species-metrics "$COMPARISON_OUT/species_metrics.csv" \
+  --class-metrics "$COMPARISON_OUT/class_metrics.csv" \
+  --species-class-metrics "$COMPARISON_OUT/species_class_metrics.csv" \
+  --out-dir "$COMPARISON_OUT/plots"
+
 echo "Collecting index stats..."
 for index in "$DETECTOR_OUT"/indexes/*.amridx; do
   [[ -e "$index" ]] || continue
@@ -83,6 +92,7 @@ echo "  Class metrics:          $COMPARISON_OUT/class_metrics.csv"
 echo "  Subclass metrics:       $COMPARISON_OUT/subclass_metrics.csv"
 echo "  Species-class metrics:  $COMPARISON_OUT/species_class_metrics.csv"
 echo "  Summary:                $COMPARISON_OUT/summary.md"
+echo "  Plots:                  $COMPARISON_OUT/plots"
 echo "  Failure analysis:  $FAILURE_OUT"
 echo "  Index stats:       $RUN/index_stats_*.txt"
 echo "  Index sizes:       $RUN/index_size_*.txt"

@@ -3,7 +3,11 @@ name = "sparrowhawk-amr-benchmark"
 version = "0.1.0"
 description = "Python benchmark orchestration for sparrowhawk-amr against native AMRFinderPlus"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "matplotlib",
+    "numpy",
+    "pandas",
+]
 
 [project.scripts]
 amr-profile-dataset = "sparrowhawk_amr_benchmark.profile_dataset:main"
@@ -13,6 +17,7 @@ amr-run-detector-batch = "sparrowhawk_amr_benchmark.run_detector_batch:main"
 amr-compare-amrfinder-batch = "sparrowhawk_amr_benchmark.compare_amrfinder_batch:main"
 amr-report-results = "sparrowhawk_amr_benchmark.report_results:main"
 amr-analyze-failures = "sparrowhawk_amr_benchmark.analyze_amrfinder_failures:main"
+amr-plot-results = "sparrowhawk_amr_benchmark.plot_results:main"
 
 [build-system]
 requires = ["hatchling"]

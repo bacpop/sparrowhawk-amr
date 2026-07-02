@@ -39,6 +39,12 @@ By default, `amr-select-subset` does stratified selection with the existing rich
 
 Use `FULL_SET=1` or `amr-select-subset --full-set` to evaluate every assembly represented in the input CSV.
 
+## Plots
+
+The final comparison script also runs `amr-plot-results` and writes plots to `$COMPARISON_OUT/plots`. It creates report-unit sensitivity/specificity/F1 plots by species and antibiotic class, assembly-count histograms by species and class, and stacked count plots crossing species with antibiotic class.
+
+Set `IBM_PLEX_SANS_REGULAR`, `IBM_PLEX_SANS_ITALIC`, and `IBM_PLEX_SANS_BOLD` to use explicit IBM Plex Sans font files. If these are unset, matplotlib falls back to its default sans font.
+
 ## Metrics
 
 Public comparison outputs report only two metric levels:
