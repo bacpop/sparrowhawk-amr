@@ -37,9 +37,43 @@ def expected_fasta_path(row: dict[str, str], out_dir: Path) -> Path:
     return out_dir / row["assembly_id"] / local_fasta_name(row["assembly_id"])
 
 
+def fasta_validation_error(path: Path) -> str:
+    if not path.exists():
+        return "missing"
+    if path.stat().st_size == 0:
+        return "empty"
+    with path.open("rt", errors="replace") as handle:
+        for line in handle:
+            stripped = line.strip()
+            if stripped:
+                return "" if stripped.startswith(">") else "not_fasta"
+    return "empty"
+
+
 def has_expected_fasta(row: dict[str, str], out_dir: Path) -> bool:
-    fasta_path = expected_fasta_path(row, out_dir)
-    return fasta_path.exists() and fasta_path.stat().st_size > 0
+    return fasta_validation_error(expected_fasta_path(row, out_dir)) == ""
+
+
+def inspect_existing_fastas(rows: list[dict[str, str]], out_dir: Path) -> dict[str, object]:
+    existing = 0
+    valid = 0
+    invalid: list[dict[str, str]] = []
+    for row in rows:
+        path = expected_fasta_path(row, out_dir)
+        error = fasta_validation_error(path)
+        if path.exists():
+            existing += 1
+        if not error:
+            valid += 1
+        elif error != "missing":
+            invalid.append(
+                {
+                    "assembly_id": row["assembly_id"],
+                    "path": str(path),
+                    "reason": error,
+                }
+            )
+    return {"existing": existing, "valid": valid, "invalid": invalid}
 
 
 def alternate_accessions(assembly_id: str) -> list[str]:
@@ -57,7 +91,8 @@ def fetch_one(row: dict[str, str], out_dir: Path) -> dict[str, str]:
     fasta_path = assembly_dir / local_fasta_name(assembly_id)
     gz_path = fasta_path.with_suffix(".fna.gz")
     expected_fasta = str(fasta_path)
-    if fasta_path.exists() and fasta_path.stat().st_size > 0:
+    cache_error = fasta_validation_error(fasta_path)
+    if not cache_error:
         return {
             **row,
             "local_fasta_path": expected_fasta,
@@ -65,6 +100,8 @@ def fetch_one(row: dict[str, str], out_dir: Path) -> dict[str, str]:
             "fetch_status": "cached",
             "fetch_message": "",
         }
+    if cache_error != "missing" and fasta_path.exists():
+        fasta_path.unlink()
 
     attempts: list[str] = []
     for accession in alternate_accessions(assembly_id):
@@ -80,7 +117,8 @@ def fetch_one(row: dict[str, str], out_dir: Path) -> dict[str, str]:
                 decompress_gzip(gz_path, fasta_path)
                 if gz_path.exists():
                     gz_path.unlink()
-                if fasta_path.exists() and fasta_path.stat().st_size > 0:
+                validation_error = fasta_validation_error(fasta_path)
+                if not validation_error:
                     return {
                         **row,
                         "local_fasta_path": expected_fasta,
@@ -88,7 +126,9 @@ def fetch_one(row: dict[str, str], out_dir: Path) -> dict[str, str]:
                         "fetch_status": "downloaded",
                         "fetch_message": "",
                     }
-                attempts.append(f"{accession}: downloaded but FASTA missing or empty at {expected_fasta} from {url}")
+                attempts.append(
+                    f"{accession}: downloaded invalid FASTA at {expected_fasta}: {validation_error} from {url}"
+                )
             except Exception as exc:  # noqa: BLE001
                 attempts.append(f"{accession}: {url}: {exc}")
             finally:
@@ -104,12 +144,42 @@ def fetch_one(row: dict[str, str], out_dir: Path) -> dict[str, str]:
     }
 
 
-def fetch_round(rows: list[dict[str, str]], out_dir: Path, jobs: int) -> list[dict[str, str]]:
+def cached_result(row: dict[str, str], out_dir: Path) -> dict[str, str]:
+    fasta_path = expected_fasta_path(row, out_dir)
+    return {
+        **row,
+        "local_fasta_path": str(fasta_path),
+        "download_url": row.get("download_url", ""),
+        "fetch_status": "cached",
+        "fetch_message": "",
+    }
+
+
+def fetch_round(rows: list[dict[str, str]], out_dir: Path, jobs: int, label: str) -> list[dict[str, str]]:
     results = []
+    total = len(rows)
+    if total == 0:
+        return results
+    print(f"{label}: fetching {total} assembly FASTA file(s) with {max(1, jobs)} job(s).", file=sys.stderr)
+    completed = 0
+    downloaded = 0
+    cached = 0
+    failed = 0
     with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
         futures = [pool.submit(fetch_one, row, out_dir) for row in rows]
         for future in as_completed(futures):
-            results.append(future.result())
+            row = future.result()
+            results.append(row)
+            completed += 1
+            status = row.get("fetch_status", "")
+            downloaded += status == "downloaded"
+            cached += status == "cached"
+            failed += status == "failed"
+            if completed == total or completed % 25 == 0:
+                print(
+                    f"{label}: {completed}/{total} complete; downloaded={downloaded}; cached={cached}; failed={failed}",
+                    file=sys.stderr,
+                )
     return results
 
 
@@ -145,7 +215,26 @@ def main() -> None:
     if args.limit > 0:
         rows = rows[: args.limit]
 
-    results = fetch_round(rows, args.out_dir, args.jobs)
+    print(f"Checking existing FASTA files under {args.out_dir}...", file=sys.stderr)
+    cache = inspect_existing_fastas(rows, args.out_dir)
+    invalid = cache["invalid"]
+    need_download = len(rows) - int(cache["valid"])
+    print(
+        f"Found {cache['existing']} expected FASTA path(s); {cache['valid']} valid; {len(invalid)} invalid/corrupt/empty.",
+        file=sys.stderr,
+    )
+    print(f"Need to download {need_download} FASTA file(s).", file=sys.stderr)
+    for item in invalid[:10]:
+        print(
+            f"Invalid cached FASTA: assembly_id={item['assembly_id']} reason={item['reason']} path={item['path']}",
+            file=sys.stderr,
+        )
+    if len(invalid) > 10:
+        print(f"... {len(invalid) - 10} additional invalid cached FASTA file(s) omitted.", file=sys.stderr)
+
+    cached_rows = [cached_result(row, args.out_dir) for row in rows if has_expected_fasta(row, args.out_dir)]
+    rows_to_fetch = [row for row in rows if not has_expected_fasta(row, args.out_dir)]
+    results = cached_rows + fetch_round(rows_to_fetch, args.out_dir, args.jobs, "Initial fetch")
     for retry_round in range(1, args.retry_missing_rounds + 1):
         missing = missing_rows(results, args.out_dir)
         if not missing:
@@ -156,7 +245,10 @@ def main() -> None:
         )
         if args.retry_sleep > 0:
             time.sleep(args.retry_sleep)
-        results = merge_results(results, fetch_round(missing, args.out_dir, args.retry_jobs))
+        results = merge_results(
+            results,
+            fetch_round(missing, args.out_dir, args.retry_jobs, f"Retry {retry_round}"),
+        )
 
     final_missing = missing_rows(results, args.out_dir)
     ordered = ordered_rows(results)

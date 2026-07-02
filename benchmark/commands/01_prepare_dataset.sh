@@ -173,7 +173,7 @@ if [[ -n "$ANTIBIOTIC_CLASSES" ]]; then
 fi
 uv --directory "$BENCHMARK_DIR" run amr-select-subset "${SELECT_ARGS[@]}"
 
-echo "Fetching selected assemblies..."
+echo "Checking cached FASTA files and fetching missing assemblies..."
 mkdir -p "$(dirname "$FETCHED_MANIFEST")"
 uv --directory "$BENCHMARK_DIR" run amr-fetch-assemblies \
   --manifest "$SELECTED_MANIFEST" \
