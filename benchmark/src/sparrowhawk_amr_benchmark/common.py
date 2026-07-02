@@ -415,24 +415,6 @@ def decompress_gzip(source: Path, destination: Path) -> None:
         out_handle.write(in_handle.read())
 
 
-def detector_bin_from_manifest(manifest_path: Path) -> Path:
-    crate_dir = manifest_path.parent
-    primary = crate_dir / "target" / "debug" / "sparrowhawk-amr"
-    if primary.exists():
-        return primary
-    return crate_dir / "target" / "debug" / "amr-bridge"
-
-
-def ensure_detector_binary(manifest_path: Path) -> Path:
-    binary = detector_bin_from_manifest(manifest_path)
-    result = shell(["cargo", "build", "--manifest-path", str(manifest_path)])
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "cargo build failed")
-    primary = manifest_path.parent / "target" / "debug" / "sparrowhawk-amr"
-    if primary.exists():
-        return primary
-    return binary
-
 
 def quantile_bin(values: Sequence[AssemblyRecord], bins: int = 4) -> List[List[AssemblyRecord]]:
     if not values:

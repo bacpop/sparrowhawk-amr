@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 try:
-    from .common import ensure_detector_binary, ensure_dir, read_csv, run_and_time, write_csv
+    from .common import ensure_dir, read_csv, run_and_time, write_csv
 except ImportError:
-    from common import ensure_detector_binary, ensure_dir, read_csv, run_and_time, write_csv
+    from common import ensure_dir, read_csv, run_and_time, write_csv
 
 
 def run_build_index(
@@ -188,8 +189,7 @@ def format_fraction_label(value: float) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run Rust detector on benchmark cohort")
     parser.add_argument("--manifest", type=Path, required=True)
-    parser.add_argument("--detector-manifest", type=Path, required=True)
-    parser.add_argument("--detector-bin", type=Path)
+    parser.add_argument("--detector-bin", type=Path, required=True)
     parser.add_argument("--db-root", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--modes", type=str, default="direct")
@@ -211,9 +211,11 @@ def main() -> None:
     parser.add_argument("--jobs", type=int, default=2)
     args = parser.parse_args()
 
-    detector_bin = args.detector_bin if args.detector_bin else ensure_detector_binary(args.detector_manifest)
-    if not detector_bin.exists():
+    detector_bin = args.detector_bin
+    if not detector_bin.exists() or not detector_bin.is_file():
         raise FileNotFoundError(f"detector binary not found: {detector_bin}")
+    if not os.access(detector_bin, os.X_OK):
+        raise PermissionError(f"detector binary is not executable: {detector_bin}")
     manifest_rows = read_csv(args.manifest)
     modes = parse_csv_modes(args.modes)
     ks = parse_csv_ints(args.ks)
