@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import collections
 import hashlib
 import math
@@ -244,11 +245,12 @@ def select_records(args: argparse.Namespace, records: list[AssemblyRecord]) -> t
         class_targets,
         args.class_floor,
     )
-    if shortfalls:
-        raise SystemExit("Unsatisfied floor(s): " + "; ".join(
-            f"{item['kind']}={item['name']} required={item['required']} available={item['available']}"
-            for item in shortfalls
-        ))
+    for item in shortfalls:
+        print(
+            "Warning: unsatisfied floor "
+            f"{item['kind']}={item['name']} required={item['required']} available={item['available']} selected={item['selected']}",
+            file=sys.stderr,
+        )
 
     for target in species_targets:
         candidates = [record for record in records if matches_species_target(record, target)]
@@ -268,6 +270,7 @@ def select_records(args: argparse.Namespace, records: list[AssemblyRecord]) -> t
         "eskapee_floor": args.eskapee_floor,
         "antibiotic_classes": class_targets,
         "class_floor": args.class_floor,
+        "shortfalls": shortfalls,
     }
 
 
