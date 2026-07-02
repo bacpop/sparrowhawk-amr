@@ -6,7 +6,6 @@ __pycache__/
 /benchmark/.venv
 /benchmark/__pycache__/
 /benchmark/src/**/__pycache__/
-/benchmark/data/
 /benchmark/fasta/
 /benchmark/manifests/
 /benchmark/detector/
