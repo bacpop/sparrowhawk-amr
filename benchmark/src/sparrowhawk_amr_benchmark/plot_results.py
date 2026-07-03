@@ -4,6 +4,7 @@ import argparse
 import os
 from collections import Counter, defaultdict
 from pathlib import Path
+from typing import Callable
 
 import matplotlib
 
@@ -24,6 +25,35 @@ BLUE = "#193F90"
 GREEN = "#18974C"
 BLACK = "#111111"
 GREY = "#666666"
+STACKED_PALETTE = [
+    "#C5D5F0",
+    "#4F0427",
+    "#44F270",
+    "#F612A8",
+    "#83AA3E",
+    "#760796",
+    "#C9F07F",
+    "#270FE2",
+    "#E9C338",
+    "#2E2274",
+    "#87D6BC",
+    "#AD2A58",
+    "#0CA82E",
+    "#CE3BF6",
+    "#1B511D",
+    "#DD8EEB",
+    "#111111",
+    "#FA8D80",
+    "#1F9383",
+    "#F8381B",
+    "#3D84E3",
+    "#9E4302",
+    "#074D65",
+    "#FD8F20",
+    "#874E57",
+    "#7A8683",
+    "#957206",
+]
 AXIS_TITLE_SIZE = 12
 LABEL_SIZE = 9
 TITLE_SIZE = 11
@@ -35,6 +65,27 @@ CONFIG_COLUMNS = (
     "min_gene_threshold",
     "min_report_unit_threshold",
 )
+CLASS_ALIASES = {
+    "FUSICDIC ACID": "FUSIDIC_ACID",
+    "FUSICDIC_ACID": "FUSIDIC_ACID",
+    "FUSIDIC ACID": "FUSIDIC_ACID",
+}
+METAL_CLASSES = {
+    "ARSENIC",
+    "CADMIUM",
+    "CADMIUM/LEAD/ZINC",
+    "CHROMATE",
+    "COPPER",
+    "COPPER/GOLD",
+    "COPPER/NICKEL",
+    "COPPER/SILVER",
+    "FLUORIDE",
+    "GOLD",
+    "MERCURY",
+    "NICKEL",
+    "SILVER",
+    "TELLURIUM",
+}
 
 
 def font_prop(env_name: str) -> FontProperties | None:
@@ -120,6 +171,174 @@ def safe_float(value: object) -> float:
         return 0.0
 
 
+def safe_ratio(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
+    denominator = denominator.replace(0, np.nan)
+    return (numerator / denominator).fillna(0)
+
+
+def is_missing(value: object) -> bool:
+    return value is None or bool(pd.isna(value))
+
+
+def split_classes(raw: object) -> list[str]:
+    if is_missing(raw):
+        return []
+    return [part.strip() for part in str(raw).split(";") if part.strip()]
+
+
+def normalise_class_name(value: object) -> str:
+    if is_missing(value):
+        return "Unclassified"
+    text = str(value).strip()
+    if not text:
+        return "Unclassified"
+    return CLASS_ALIASES.get(text.upper(), text)
+
+
+def normalise_species_name(value: object) -> str:
+    if is_missing(value):
+        return "Unknown species"
+    text = str(value).strip()
+    return text if text else "Unknown species"
+
+
+def aggregate_species_name(value: object) -> str:
+    species = normalise_species_name(value)
+    genus = species.split(" ", 1)[0]
+    if genus == "Shigella":
+        return "Shigella spp."
+    if genus == "Enterobacter":
+        return "Enterobacter spp."
+    return species
+
+
+def aggregate_class_name(value: object) -> str:
+    class_name = normalise_class_name(value)
+    if class_name.upper() in METAL_CLASSES:
+        return "Metals"
+    return class_name
+
+
+def normalise_selected(dataframe: pd.DataFrame) -> pd.DataFrame:
+    out = dataframe.copy()
+    if "species" in out.columns:
+        out["species"] = out["species"].map(normalise_species_name)
+    else:
+        out["species"] = "Unknown species"
+    classes = out.get("classes", pd.Series([""] * len(out), index=out.index))
+    out["classes"] = classes.map(lambda raw: ";".join(normalise_class_name(item) for item in split_classes(raw)))
+    return out
+
+
+def normalise_metric_labels(dataframe: pd.DataFrame) -> pd.DataFrame:
+    out = dataframe.copy()
+    if "species" in out.columns:
+        out["species"] = out["species"].map(normalise_species_name)
+    if "class_name" in out.columns:
+        out["class_name"] = out["class_name"].map(normalise_class_name)
+    return out
+
+
+def metric_count_columns(dataframe: pd.DataFrame) -> list[str]:
+    return [column for column in dataframe.columns if column.endswith(("_tp", "_fp", "_fn", "_tn"))]
+
+
+def recompute_metric_fields(dataframe: pd.DataFrame) -> pd.DataFrame:
+    out = dataframe.copy()
+    for prefix in ("exact", "report_unit"):
+        required = {f"{prefix}_tp", f"{prefix}_fp", f"{prefix}_fn", f"{prefix}_tn"}
+        if not required <= set(out.columns):
+            continue
+        precision = safe_ratio(out[f"{prefix}_tp"], out[f"{prefix}_tp"] + out[f"{prefix}_fp"])
+        recall = safe_ratio(out[f"{prefix}_tp"], out[f"{prefix}_tp"] + out[f"{prefix}_fn"])
+        out[f"{prefix}_precision"] = precision
+        out[f"{prefix}_recall"] = recall
+        out[f"{prefix}_sensitivity"] = recall
+        out[f"{prefix}_specificity"] = safe_ratio(out[f"{prefix}_tn"], out[f"{prefix}_tn"] + out[f"{prefix}_fp"])
+        out[f"{prefix}_f1"] = safe_ratio(2 * precision * recall, precision + recall)
+    return out.fillna(0)
+
+
+def merge_metric_rows(dataframe: pd.DataFrame, label_column: str) -> pd.DataFrame:
+    if dataframe.empty or label_column not in dataframe.columns:
+        return dataframe
+    count_columns = metric_count_columns(dataframe)
+    if not count_columns:
+        return dataframe
+    group_columns = [column for column in CONFIG_COLUMNS if column in dataframe.columns] + [label_column]
+    sum_columns = count_columns + (["assemblies_compared"] if "assemblies_compared" in dataframe.columns else [])
+    grouped = dataframe.groupby(group_columns, dropna=False)[sum_columns].sum().reset_index()
+    return recompute_metric_fields(grouped)
+
+
+def aggregate_metric_rows(dataframe: pd.DataFrame, label_column: str, mapper: Callable[[object], str]) -> pd.DataFrame:
+    if dataframe.empty or label_column not in dataframe.columns:
+        return dataframe
+    out = dataframe.copy()
+    out[label_column] = out[label_column].map(mapper)
+    return merge_metric_rows(out, label_column)
+
+
+def aggregate_selected(dataframe: pd.DataFrame) -> pd.DataFrame:
+    out = dataframe.copy()
+    out["species"] = out["species"].map(aggregate_species_name)
+    out["classes"] = out["classes"].map(
+        lambda raw: ";".join(sorted({aggregate_class_name(item) for item in split_classes(raw)}))
+    )
+    return out
+
+
+def warn_unclassified_sources(selected: pd.DataFrame, class_metrics: pd.DataFrame, species_class_metrics: pd.DataFrame | None) -> None:
+    selected_empty = int(selected.get("classes", pd.Series(dtype=str)).map(lambda raw: len(split_classes(raw)) == 0).sum())
+    metric_unclassified = int((class_metrics.get("class_name", pd.Series(dtype=str)) == "Unclassified").sum())
+    if selected_empty:
+        print(f"Warning: {selected_empty} selected assemblies have no class metadata and will be plotted as Unclassified.")
+    if metric_unclassified:
+        print(
+            "Warning: class_metrics.csv contains Unclassified rows. "
+            "This usually means AMRFinderPlus Class or detector class_name was blank/missing for at least one call."
+        )
+    if species_class_metrics is not None and "class_name" in species_class_metrics.columns:
+        species_class_unclassified = int((species_class_metrics["class_name"] == "Unclassified").sum())
+        if species_class_unclassified:
+            print(f"Warning: species_class_metrics.csv contains {species_class_unclassified} Unclassified rows.")
+
+
+def ordered_labels_from_counts(counts: pd.Series, max_labels: int) -> list[str]:
+    ordered = counts.sort_values(ascending=False)
+    if max_labels > 0:
+        ordered = ordered.head(max_labels)
+    return [str(label) for label in ordered.index]
+
+
+def apply_order_to_metric_rows(dataframe: pd.DataFrame, label_column: str, order: list[str]) -> pd.DataFrame:
+    if dataframe.empty:
+        return dataframe
+    rows = dataframe.set_index(label_column, drop=False)
+    ordered_rows = [rows.loc[label] for label in order if label in rows.index]
+    return pd.DataFrame(ordered_rows) if ordered_rows else dataframe.iloc[0:0]
+
+
+def apply_order_to_counts(counts: pd.Series, order: list[str]) -> pd.Series:
+    return counts.reindex([label for label in order if label in counts.index]).dropna()
+
+
+def apply_order_to_table(table: pd.DataFrame, row_order: list[str], column_order: list[str]) -> pd.DataFrame:
+    rows = [label for label in row_order if label in table.index]
+    cols = [label for label in column_order if label in table.columns]
+    return table.reindex(index=rows, columns=cols).fillna(0)
+
+
+def set_axis_ticklabels(axis: plt.Axes, labels: list[str], regular: FontProperties | None, italic: FontProperties | None, italic_labels: bool) -> None:
+    axis.set_yticklabels(labels, fontsize=LABEL_SIZE)
+    if italic_labels and italic:
+        for label in axis.get_yticklabels():
+            label.set_fontproperties(italic)
+    elif regular:
+        for label in axis.get_yticklabels():
+            label.set_fontproperties(regular)
+
+
 def threshold_column(dataframe: pd.DataFrame) -> str:
     if "min_report_unit_threshold" in dataframe.columns:
         return "min_report_unit_threshold"
@@ -170,14 +389,20 @@ def filter_config(dataframe: pd.DataFrame, config: dict[str, str]) -> pd.DataFra
     return out
 
 
-def maybe_limit(dataframe: pd.DataFrame, label_column: str, value_column: str, max_labels: int) -> pd.DataFrame:
-    out = dataframe.sort_values([value_column, label_column], ascending=[False, True])
-    if max_labels > 0:
-        out = out.head(max_labels)
-    return out.iloc[::-1]
-
-
-def metric_plot(dataframe: pd.DataFrame, label_column: str, title: str, basename: str, out_dir: Path, formats: list[str], regular: FontProperties | None, italic: FontProperties | None, bold: FontProperties | None, preliminary: bool, max_labels: int) -> None:
+def metric_plot(
+    dataframe: pd.DataFrame,
+    label_column: str,
+    title: str,
+    basename: str,
+    out_dir: Path,
+    formats: list[str],
+    regular: FontProperties | None,
+    italic: FontProperties | None,
+    bold: FontProperties | None,
+    preliminary: bool,
+    counts: pd.Series | None = None,
+    italic_labels: bool = False,
+) -> None:
     required = {label_column, "report_unit_sensitivity", "report_unit_specificity", "report_unit_f1"}
     missing = required - set(dataframe.columns)
     if missing:
@@ -186,8 +411,8 @@ def metric_plot(dataframe: pd.DataFrame, label_column: str, title: str, basename
     plot_df["report_unit_sensitivity"] = plot_df["report_unit_sensitivity"].map(safe_float)
     plot_df["report_unit_specificity"] = plot_df["report_unit_specificity"].map(safe_float)
     plot_df["report_unit_f1"] = plot_df["report_unit_f1"].map(safe_float)
-    plot_df = maybe_limit(plot_df, label_column, "report_unit_f1", max_labels)
     labels = plot_df[label_column].astype(str).tolist()
+    display_labels = [f"{label} (n={int(counts[label])})" if counts is not None and label in counts.index else label for label in labels]
     y = np.arange(len(labels))
     height = max(4.0, 0.31 * len(labels) + 1.6)
     fig, ax = plt.subplots(figsize=(8.5, height), dpi=150)
@@ -195,18 +420,27 @@ def metric_plot(dataframe: pd.DataFrame, label_column: str, title: str, basename
     ax.barh(y, plot_df["report_unit_sensitivity"], height=0.42, color=BLUE, alpha=0.80, label="Sensitivity", zorder=2)
     ax.scatter(plot_df["report_unit_f1"], y, color=BLACK, s=18, label="F1", zorder=3)
     ax.set_yticks(y)
-    ax.set_yticklabels(labels, fontsize=LABEL_SIZE)
+    set_axis_ticklabels(ax, display_labels, regular, italic, italic_labels)
     ax.set_xlim(0.0, 1.0)
+    if len(labels):
+        ax.set_ylim(-0.5, len(labels) - 0.5)
+    ax.margins(y=0)
     ax.set_xlabel("Value", fontproperties=regular, loc="right", fontsize=AXIS_TITLE_SIZE)
     ax.set_ylabel(title, fontproperties=regular, loc="top", fontsize=AXIS_TITLE_SIZE)
-    ax.legend(loc="lower right", frameon=False, prop=regular, handlelength=0.7, handletextpad=0.6, labelspacing=0.3)
+    ax.legend(
+        loc="lower right",
+        frameon=True,
+        facecolor="white",
+        edgecolor="white",
+        framealpha=0.92,
+        prop=regular,
+        handlelength=0.7,
+        handletextpad=0.6,
+        labelspacing=0.3,
+    )
     add_headers(ax, title, "Report-unit metrics", regular, italic, bold, preliminary)
     style_axis(ax, regular)
     save_figure(fig, out_dir, basename, formats)
-
-
-def split_classes(raw: object) -> list[str]:
-    return [part.strip() for part in str(raw or "").split(";") if part.strip()]
 
 
 def species_counts(selected: pd.DataFrame) -> pd.Series:
@@ -224,12 +458,9 @@ def class_counts(selected: pd.DataFrame) -> pd.Series:
     return pd.Series(counter).sort_values(ascending=False)
 
 
-def count_plot(counts: pd.Series, title: str, basename: str, out_dir: Path, formats: list[str], regular: FontProperties | None, italic: FontProperties | None, bold: FontProperties | None, preliminary: bool, max_labels: int) -> None:
+def count_plot(counts: pd.Series, title: str, basename: str, out_dir: Path, formats: list[str], regular: FontProperties | None, italic: FontProperties | None, bold: FontProperties | None, preliminary: bool, italic_labels: bool = False) -> None:
     if counts.empty:
         raise SystemExit(f"No values available for {title}")
-    counts = counts.sort_values(ascending=False)
-    if max_labels > 0:
-        counts = counts.head(max_labels)
     counts = counts.iloc[::-1]
     labels = [str(label) for label in counts.index]
     y = np.arange(len(labels))
@@ -237,7 +468,7 @@ def count_plot(counts: pd.Series, title: str, basename: str, out_dir: Path, form
     fig, ax = plt.subplots(figsize=(8.5, height), dpi=150)
     ax.barh(y, counts.values, height=0.62, color=GREEN, alpha=0.85)
     ax.set_yticks(y)
-    ax.set_yticklabels(labels, fontsize=LABEL_SIZE)
+    set_axis_ticklabels(ax, labels, regular, italic, italic_labels)
     ax.set_xlim(0, max(float(counts.max()) * 1.08, 1.0))
     ax.set_xlabel("Assemblies", fontproperties=regular, loc="right", fontsize=AXIS_TITLE_SIZE)
     ax.set_ylabel(title, fontproperties=regular, loc="top", fontsize=AXIS_TITLE_SIZE)
@@ -249,39 +480,39 @@ def count_plot(counts: pd.Series, title: str, basename: str, out_dir: Path, form
 def species_class_table(selected: pd.DataFrame) -> pd.DataFrame:
     counts: dict[str, Counter[str]] = defaultdict(Counter)
     for _, row in selected.iterrows():
-        species = str(row.get("species", "") or "Unknown species")
+        species = normalise_species_name(row.get("species", ""))
         classes = split_classes(row.get("classes", "")) or ["Unclassified"]
         for class_name in classes:
-            counts[species][class_name] += 1
+            counts[species][normalise_class_name(class_name)] += 1
     return pd.DataFrame(counts).T.fillna(0).astype(float)
 
 
-def maybe_limit_table(table: pd.DataFrame, max_labels: int) -> pd.DataFrame:
-    if max_labels <= 0 or len(table.index) <= max_labels:
-        return table
-    return table.loc[table.sum(axis=1).sort_values(ascending=False).head(max_labels).index]
-
-
-def stacked_plot(table: pd.DataFrame, title: str, contribution_label: str, basename: str, out_dir: Path, formats: list[str], regular: FontProperties | None, italic: FontProperties | None, bold: FontProperties | None, preliminary: bool, max_labels: int) -> None:
-    table = maybe_limit_table(table, max_labels)
-    table = table.loc[table.sum(axis=1).sort_values(ascending=True).index]
+def stacked_plot(table: pd.DataFrame, title: str, contribution_label: str, basename: str, out_dir: Path, formats: list[str], regular: FontProperties | None, italic: FontProperties | None, bold: FontProperties | None, preliminary: bool, italic_labels: bool = False, italic_contributions: bool = False) -> None:
     if table.empty:
         raise SystemExit(f"No values available for {title}")
+    table = table.iloc[::-1]
     labels = [str(label) for label in table.index]
     contributions = list(table.columns)
     y = np.arange(len(labels))
     height = max(4.5, 0.33 * len(labels) + 1.8)
     fig, ax = plt.subplots(figsize=(9.5, height), dpi=150)
-    palette = plt.get_cmap("tab20")
     left = np.zeros(len(labels))
+    warned_palette_wrap = False
     for idx, contribution in enumerate(contributions):
         values = table[contribution].to_numpy(dtype=float)
         if np.all(values == 0):
             continue
-        ax.barh(y, values, left=left, height=0.68, color=palette(idx % 20), label=str(contribution), alpha=0.88)
+        if idx >= len(STACKED_PALETTE) and not warned_palette_wrap:
+            print(
+                f"Warning: stacked plot palette has {len(STACKED_PALETTE)} colours; "
+                "additional contributions will reuse colours."
+            )
+            warned_palette_wrap = True
+        colour = STACKED_PALETTE[idx % len(STACKED_PALETTE)]
+        ax.barh(y, values, left=left, height=0.68, color=colour, label=str(contribution), alpha=0.88)
         left += values
     ax.set_yticks(y)
-    ax.set_yticklabels(labels, fontsize=LABEL_SIZE)
+    set_axis_ticklabels(ax, labels, regular, italic, italic_labels)
     ax.set_xscale("log")
     positive_total = table.sum(axis=1)
     positive_total = positive_total[positive_total > 0]
@@ -290,8 +521,27 @@ def stacked_plot(table: pd.DataFrame, title: str, contribution_label: str, basen
     ax.set_ylabel(title, fontproperties=regular, loc="top", fontsize=AXIS_TITLE_SIZE)
     add_headers(ax, title, f"Stacked by {contribution_label}", regular, italic, bold, preliminary)
     style_axis(ax, regular, minor=False)
-    ax.legend(loc="center left", bbox_to_anchor=(1.01, 0.5), frameon=False, prop=regular, fontsize=8, handlelength=0.7, handletextpad=0.5, labelspacing=0.25)
+    legend = ax.legend(loc="center left", bbox_to_anchor=(1.01, 0.5), frameon=False, prop=regular, fontsize=8, handlelength=0.7, handletextpad=0.5, labelspacing=0.25)
+    if italic_contributions and italic:
+        for text in legend.get_texts():
+            text.set_fontproperties(italic)
     save_figure(fig, out_dir, basename, formats)
+
+
+def plot_suite(selected: pd.DataFrame, species_metrics: pd.DataFrame, class_metrics: pd.DataFrame, out_dir: Path, formats: list[str], regular: FontProperties | None, italic: FontProperties | None, bold: FontProperties | None, preliminary: bool, max_labels: int, suffix: str = "") -> None:
+    species_count_values = species_counts(selected)
+    class_count_values = class_counts(selected)
+    species_order = ordered_labels_from_counts(species_count_values, max_labels)
+    class_order = ordered_labels_from_counts(class_count_values, max_labels)
+    species_table = apply_order_to_metric_rows(species_metrics, "species", species_order)
+    class_table = apply_order_to_metric_rows(class_metrics, "class_name", class_order)
+    metric_plot(species_table.iloc[::-1], "species", "Species", f"report_unit_species_metrics{suffix}", out_dir, formats, regular, italic, bold, preliminary, species_count_values, italic_labels=True)
+    metric_plot(class_table.iloc[::-1], "class_name", "Antibiotic class", f"report_unit_class_metrics{suffix}", out_dir, formats, regular, italic, bold, preliminary, class_count_values)
+    count_plot(apply_order_to_counts(species_count_values, species_order), "Species", f"species_assembly_counts{suffix}", out_dir, formats, regular, italic, bold, preliminary, italic_labels=True)
+    count_plot(apply_order_to_counts(class_count_values, class_order), "Antibiotic class", f"class_assembly_counts{suffix}", out_dir, formats, regular, italic, bold, preliminary)
+    table = species_class_table(selected)
+    stacked_plot(apply_order_to_table(table, species_order, class_order), "Species", "antibiotic class", f"species_counts_by_class_stacked{suffix}", out_dir, formats, regular, italic, bold, preliminary, italic_labels=True)
+    stacked_plot(apply_order_to_table(table.T, class_order, species_order), "Antibiotic class", "species", f"class_counts_by_species_stacked{suffix}", out_dir, formats, regular, italic, bold, preliminary, italic_contributions=True)
 
 
 def parse_formats(raw: str) -> list[str]:
@@ -318,19 +568,36 @@ def main() -> None:
     regular, italic, bold = load_fonts()
     aggregate = pd.read_csv(args.aggregate_metrics) if args.aggregate_metrics and args.aggregate_metrics.exists() else None
     config = choose_config(aggregate, args.mode, args.k)
-    selected = pd.read_csv(args.selected_manifest)
-    species_metrics = filter_config(pd.read_csv(args.species_metrics), config)
-    class_metrics = filter_config(pd.read_csv(args.class_metrics), config)
+    selected = normalise_selected(pd.read_csv(args.selected_manifest))
+    species_metrics = merge_metric_rows(normalise_metric_labels(filter_config(pd.read_csv(args.species_metrics), config)), "species")
+    class_metrics = merge_metric_rows(normalise_metric_labels(filter_config(pd.read_csv(args.class_metrics), config)), "class_name")
+    species_class_metrics = None
+    if args.species_class_metrics and args.species_class_metrics.exists():
+        species_class_metrics = normalise_metric_labels(filter_config(pd.read_csv(args.species_class_metrics), config))
     preliminary = not args.no_preliminary
 
+    warn_unclassified_sources(selected, class_metrics, species_class_metrics)
     ensure_dir(args.out_dir)
-    metric_plot(species_metrics, "species", "Species", "report_unit_species_metrics", args.out_dir, formats, regular, italic, bold, preliminary, args.max_labels)
-    metric_plot(class_metrics, "class_name", "Antibiotic class", "report_unit_class_metrics", args.out_dir, formats, regular, italic, bold, preliminary, args.max_labels)
-    count_plot(species_counts(selected), "Species", "species_assembly_counts", args.out_dir, formats, regular, italic, bold, preliminary, args.max_labels)
-    count_plot(class_counts(selected), "Antibiotic class", "class_assembly_counts", args.out_dir, formats, regular, italic, bold, preliminary, args.max_labels)
-    table = species_class_table(selected)
-    stacked_plot(table, "Species", "antibiotic class", "species_counts_by_class_stacked", args.out_dir, formats, regular, italic, bold, preliminary, args.max_labels)
-    stacked_plot(table.T, "Antibiotic class", "species", "class_counts_by_species_stacked", args.out_dir, formats, regular, italic, bold, preliminary, args.max_labels)
+    plot_suite(selected, species_metrics, class_metrics, args.out_dir, formats, regular, italic, bold, preliminary, args.max_labels)
+
+    aggregated_selected = aggregate_selected(selected)
+    aggregated_species_metrics = aggregate_metric_rows(species_metrics, "species", aggregate_species_name)
+    aggregated_class_metrics = aggregate_metric_rows(class_metrics, "class_name", aggregate_class_name)
+    aggregated_out_dir = args.out_dir / "aggregated"
+    ensure_dir(aggregated_out_dir)
+    plot_suite(
+        aggregated_selected,
+        aggregated_species_metrics,
+        aggregated_class_metrics,
+        aggregated_out_dir,
+        formats,
+        regular,
+        italic,
+        bold,
+        preliminary,
+        args.max_labels,
+        "_aggregated",
+    )
 
 
 if __name__ == "__main__":

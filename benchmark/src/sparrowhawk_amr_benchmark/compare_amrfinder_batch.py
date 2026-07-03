@@ -412,6 +412,8 @@ def main() -> None:
         subclass_universes: dict[str, dict[str, set[str]]] = collections.defaultdict(empty_universes)
         species_class_universes: dict[str, dict[str, set[str]]] = collections.defaultdict(empty_universes)
         per_assembly = []
+        missing_native_class = 0
+        missing_detector_class = 0
 
         for row in read_csv(status_csv):
             assembly_id = row["assembly_id"]
@@ -422,6 +424,8 @@ def main() -> None:
             native_rows = amr_rows(Path(baseline_row["tsv_path"]))
             detector_json_path = resolve_existing_path(row["detector_json"], status_csv.parent)
             detector_payload = load_json(detector_json_path)
+            missing_native_class += sum(1 for native_row in native_rows if not str(native_row.get("Class", "")).strip())
+            missing_detector_class += sum(1 for hit in detector_payload.get("hits", []) if not str(hit.get("class_name", "") or "").strip())
             baseline_norm = normalize_amrfinder(native_rows, report_map, hierarchy)
             detector_norm = normalize_detector(detector_payload, hierarchy)
             row_counts = metric_counts(detector_norm, baseline_norm, universes)
@@ -499,6 +503,10 @@ def main() -> None:
             f"report_unit_{params['min_report_unit_threshold']}_assemblies.csv"
         )
         write_csv(args.out_dir / out_name, list(per_assembly[0].keys()) if per_assembly else [], per_assembly)
+        if missing_native_class:
+            print(f"Warning: {missing_native_class} AMRFinderPlus rows had blank Class values and were assigned Unclassified for {status_csv}.")
+        if missing_detector_class:
+            print(f"Warning: {missing_detector_class} detector hits had blank class_name values and were assigned Unclassified for {status_csv}.")
         aggregate_rows.append(metric_row(params, micro))
         species_rows.extend(grouped_rows(species_micro, params, ("species",)))
         class_rows.extend(grouped_rows(class_micro, params, ("class_name",)))
