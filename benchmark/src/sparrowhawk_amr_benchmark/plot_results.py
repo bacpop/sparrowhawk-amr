@@ -583,13 +583,11 @@ def main() -> None:
     aggregated_selected = aggregate_selected(selected)
     aggregated_species_metrics = aggregate_metric_rows(species_metrics, "species", aggregate_species_name)
     aggregated_class_metrics = aggregate_metric_rows(class_metrics, "class_name", aggregate_class_name)
-    aggregated_out_dir = args.out_dir / "aggregated"
-    ensure_dir(aggregated_out_dir)
     plot_suite(
         aggregated_selected,
         aggregated_species_metrics,
         aggregated_class_metrics,
-        aggregated_out_dir,
+        args.out_dir,
         formats,
         regular,
         italic,

@@ -218,6 +218,52 @@ def validate_floors(
     return shortfalls
 
 
+def backfill_score(
+    record: AssemblyRecord,
+    selected: list[AssemblyRecord],
+    species_targets: list[str],
+    class_targets: list[str],
+) -> tuple[float, float, int, int, str]:
+    selected_species_counts = collections.Counter(item.species for item in selected)
+    selected_class_counts = collections.Counter(class_name for item in selected for class_name in item.classes)
+    target_species_bonus = 1.0 if any(matches_species_target(record, target) for target in species_targets) else 0.0
+    target_class_bonus = sum(1.0 for class_name in record.classes if class_name in class_targets)
+    species_underrepresentation = 1.0 / (1.0 + selected_species_counts[record.species])
+    class_underrepresentation = sum(1.0 / (1.0 + selected_class_counts[class_name]) for class_name in record.classes)
+    return (
+        target_species_bonus + target_class_bonus + species_underrepresentation + class_underrepresentation,
+        record.richness_score,
+        record.n_genes,
+        record.n_classes,
+        record.assembly_id,
+    )
+
+
+def backfill_to_target(
+    selected: list[AssemblyRecord],
+    records: list[AssemblyRecord],
+    target_size: int,
+    species_targets: list[str],
+    class_targets: list[str],
+) -> list[AssemblyRecord]:
+    if len(selected) >= target_size:
+        return selected
+
+    selected_by_id = {record.assembly_id: record for record in selected}
+    while len(selected_by_id) < target_size:
+        current = list(selected_by_id.values())
+        candidates = [record for record in records if record.assembly_id not in selected_by_id]
+        if not candidates:
+            break
+        candidates.sort(
+            key=lambda record: backfill_score(record, current, species_targets, class_targets),
+            reverse=True,
+        )
+        selected_by_id[candidates[0].assembly_id] = candidates[0]
+
+    return list(selected_by_id.values())
+
+
 def select_records(args: argparse.Namespace, records: list[AssemblyRecord]) -> tuple[list[AssemblyRecord], dict[str, object]]:
     if args.full_set:
         selected = sorted(records, key=lambda record: (record.species, -record.richness_score, record.assembly_id))
@@ -256,6 +302,10 @@ def select_records(args: argparse.Namespace, records: list[AssemblyRecord]) -> t
 
     deduped = {record.assembly_id: record for record in selected}
     selected = sorted(deduped.values(), key=lambda record: (record.species, -record.richness_score, record.assembly_id))
+    pre_backfill_size = len(selected)
+    selected = backfill_to_target(selected, records, args.target_size, species_targets, class_targets)
+    backfilled_count = len(selected) - pre_backfill_size
+    selected = sorted(selected, key=lambda record: (record.species, -record.richness_score, record.assembly_id))
     for item in shortfalls:
         if item["kind"] == "species":
             selected_count = sum(1 for record in selected if matches_species_target(record, str(item["name"])))
@@ -265,12 +315,22 @@ def select_records(args: argparse.Namespace, records: list[AssemblyRecord]) -> t
         print(
             "Warning: unsatisfied floor "
             f"{item['kind']}={item['name']} required={item['required']} available={item['available']}; "
-            f"selected_after_floor={selected_count}. Selecting all available entries.",
+            f"selected_after_floor={selected_count}. "
+            "Backfill will use other available assemblies to reach target_size where possible.",
+            file=sys.stderr,
+        )
+    if len(selected) < args.target_size:
+        print(
+            f"Warning: requested target_size={args.target_size}, but only {len(selected)} "
+            "unique assemblies are available after backfill.",
             file=sys.stderr,
         )
     return selected, {
         "selection_mode": "stratified",
         "target_size": args.target_size,
+        "pre_backfill_size": pre_backfill_size,
+        "backfilled_count": backfilled_count,
+        "target_reached": len(selected) >= args.target_size,
         "species_quotas": quotas,
         "eskapee_species": species_targets,
         "eskapee_floor": args.eskapee_floor,
