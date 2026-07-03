@@ -180,94 +180,84 @@ def add_records_for_floor(
             break
 
 
-def validate_floors(
+def floor_availability(
     records: list[AssemblyRecord],
-    selected: list[AssemblyRecord],
     species_targets: list[str],
     species_floor: int,
     class_targets: list[str],
     class_floor: int,
-) -> list[dict[str, object]]:
+) -> tuple[dict[str, int], dict[str, int], list[dict[str, object]]]:
+    species_effective = {}
+    class_effective = {}
     shortfalls: list[dict[str, object]] = []
+
     for target in species_targets:
-        available = [record for record in records if matches_species_target(record, target)]
-        selected_count = sum(1 for record in selected if matches_species_target(record, target))
-        if len(available) < species_floor:
+        available = sum(1 for record in records if matches_species_target(record, target))
+        effective = min(species_floor, available)
+        species_effective[target] = effective
+        if available < species_floor:
             shortfalls.append(
                 {
                     "kind": "species",
                     "name": target,
                     "required": species_floor,
-                    "available": len(available),
-                    "selected": selected_count,
+                    "available": available,
+                    "effective_required": effective,
+                    "selected": 0,
                 }
             )
+
     for class_name in class_targets:
-        available = [record for record in records if class_name in record.classes]
-        selected_count = sum(1 for record in selected if class_name in record.classes)
-        if len(available) < class_floor:
+        available = sum(1 for record in records if class_name in record.classes)
+        effective = min(class_floor, available)
+        class_effective[class_name] = effective
+        if available < class_floor:
             shortfalls.append(
                 {
                     "kind": "class",
                     "name": class_name,
                     "required": class_floor,
-                    "available": len(available),
-                    "selected": selected_count,
+                    "available": available,
+                    "effective_required": effective,
+                    "selected": 0,
                 }
             )
-    return shortfalls
+
+    return species_effective, class_effective, shortfalls
 
 
-def backfill_score(
-    record: AssemblyRecord,
-    selected: list[AssemblyRecord],
-    species_targets: list[str],
-    class_targets: list[str],
-) -> tuple[float, float, int, int, str]:
-    selected_species_counts = collections.Counter(item.species for item in selected)
-    selected_class_counts = collections.Counter(class_name for item in selected for class_name in item.classes)
-    target_species_bonus = 1.0 if any(matches_species_target(record, target) for target in species_targets) else 0.0
-    target_class_bonus = sum(1.0 for class_name in record.classes if class_name in class_targets)
-    species_underrepresentation = 1.0 / (1.0 + selected_species_counts[record.species])
-    class_underrepresentation = sum(1.0 / (1.0 + selected_class_counts[class_name]) for class_name in record.classes)
-    return (
-        target_species_bonus + target_class_bonus + species_underrepresentation + class_underrepresentation,
-        record.richness_score,
-        record.n_genes,
-        record.n_classes,
-        record.assembly_id,
-    )
-
-
-def backfill_to_target(
+def add_records_to_target(
     selected: list[AssemblyRecord],
     records: list[AssemblyRecord],
     target_size: int,
-    species_targets: list[str],
-    class_targets: list[str],
-) -> list[AssemblyRecord]:
-    if len(selected) >= target_size:
-        return selected
-
-    selected_by_id = {record.assembly_id: record for record in selected}
-    while len(selected_by_id) < target_size:
-        current = list(selected_by_id.values())
-        candidates = [record for record in records if record.assembly_id not in selected_by_id]
-        if not candidates:
+    seed: int,
+) -> None:
+    selected_ids = {record.assembly_id for record in selected}
+    if len(selected_ids) >= target_size:
+        return
+    for record in ranked_records(records, seed):
+        if record.assembly_id in selected_ids:
+            continue
+        selected.append(record)
+        selected_ids.add(record.assembly_id)
+        if len(selected_ids) >= target_size:
             break
-        candidates.sort(
-            key=lambda record: backfill_score(record, current, species_targets, class_targets),
-            reverse=True,
-        )
-        selected_by_id[candidates[0].assembly_id] = candidates[0]
-
-    return list(selected_by_id.values())
 
 
 def select_records(args: argparse.Namespace, records: list[AssemblyRecord]) -> tuple[list[AssemblyRecord], dict[str, object]]:
     if args.full_set:
         selected = sorted(records, key=lambda record: (record.species, -record.richness_score, record.assembly_id))
         return selected, {"selection_mode": "full_set", "target_size": len(selected)}
+
+    species_targets = split_csv(args.eskapee_species) if args.eskapee_species else []
+    class_targets = split_csv(args.antibiotic_classes) if args.antibiotic_classes else classes_in_records(records)
+    species_effective_floors, class_effective_floors, shortfalls = floor_availability(
+        records,
+        species_targets,
+        args.eskapee_floor,
+        class_targets,
+        args.class_floor,
+    )
 
     groups: dict[str, list[AssemblyRecord]] = collections.defaultdict(list)
     for record in records:
@@ -280,32 +270,21 @@ def select_records(args: argparse.Namespace, records: list[AssemblyRecord]) -> t
             continue
         selected.extend(choose_within_species(groups[species], quota, stable_species_seed(args.seed, species)))
 
-    species_targets = split_csv(args.eskapee_species) if args.eskapee_species else []
-    class_targets = split_csv(args.antibiotic_classes) if args.antibiotic_classes else classes_in_records(records)
-
-    shortfalls = validate_floors(
-        records,
-        selected,
-        species_targets,
-        args.eskapee_floor,
-        class_targets,
-        args.class_floor,
-    )
-
-    for target in species_targets:
+    for target, floor in species_effective_floors.items():
         candidates = [record for record in records if matches_species_target(record, target)]
-        add_records_for_floor(selected, candidates, args.eskapee_floor, stable_species_seed(args.seed, target))
+        add_records_for_floor(selected, candidates, floor, stable_species_seed(args.seed, target))
 
-    for class_name in class_targets:
+    for class_name, floor in class_effective_floors.items():
         candidates = [record for record in records if class_name in record.classes]
-        add_records_for_floor(selected, candidates, args.class_floor, stable_species_seed(args.seed, class_name))
+        add_records_for_floor(selected, candidates, floor, stable_species_seed(args.seed, class_name))
 
     deduped = {record.assembly_id: record for record in selected}
     selected = sorted(deduped.values(), key=lambda record: (record.species, -record.richness_score, record.assembly_id))
-    pre_backfill_size = len(selected)
-    selected = backfill_to_target(selected, records, args.target_size, species_targets, class_targets)
-    backfilled_count = len(selected) - pre_backfill_size
-    selected = sorted(selected, key=lambda record: (record.species, -record.richness_score, record.assembly_id))
+    pre_topup_size = len(selected)
+    add_records_to_target(selected, records, args.target_size, args.seed)
+    deduped = {record.assembly_id: record for record in selected}
+    selected = sorted(deduped.values(), key=lambda record: (record.species, -record.richness_score, record.assembly_id))
+    topup_count = len(selected) - pre_topup_size
     for item in shortfalls:
         if item["kind"] == "species":
             selected_count = sum(1 for record in selected if matches_species_target(record, str(item["name"])))
@@ -315,22 +294,24 @@ def select_records(args: argparse.Namespace, records: list[AssemblyRecord]) -> t
         print(
             "Warning: unsatisfied floor "
             f"{item['kind']}={item['name']} required={item['required']} available={item['available']}; "
-            f"selected_after_floor={selected_count}. "
-            "Backfill will use other available assemblies to reach target_size where possible.",
+            f"using_effective_required={item['effective_required']}. "
+            "The remaining target size is filled from other available assemblies.",
             file=sys.stderr,
         )
     if len(selected) < args.target_size:
         print(
             f"Warning: requested target_size={args.target_size}, but only {len(selected)} "
-            "unique assemblies are available after backfill.",
+            "unique assemblies are available after feasible floor selection and top-up.",
             file=sys.stderr,
         )
     return selected, {
         "selection_mode": "stratified",
         "target_size": args.target_size,
-        "pre_backfill_size": pre_backfill_size,
-        "backfilled_count": backfilled_count,
+        "pre_topup_size": pre_topup_size,
+        "topup_count": topup_count,
         "target_reached": len(selected) >= args.target_size,
+        "effective_eskapee_floors": species_effective_floors,
+        "effective_class_floors": class_effective_floors,
         "species_quotas": quotas,
         "eskapee_species": species_targets,
         "eskapee_floor": args.eskapee_floor,
