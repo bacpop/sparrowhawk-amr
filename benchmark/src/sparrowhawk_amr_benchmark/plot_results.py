@@ -70,9 +70,15 @@ CLASS_ALIASES = {
     "FUSICDIC_ACID": "FUSIDIC_ACID",
     "FUSIDIC ACID": "FUSIDIC_ACID",
 }
-METAL_CLASSES = {
+METAL_LABELS = {
+    "METAL",
+    "METALS",
     "ARSENIC",
+    "ARSENATE",
+    "ARSENITE",
+    "ORGANOARSENIC",
     "CADMIUM",
+    "CADMIUM/COBALT/NICKEL",
     "CADMIUM/LEAD/ZINC",
     "CHROMATE",
     "COPPER",
@@ -82,6 +88,8 @@ METAL_CLASSES = {
     "FLUORIDE",
     "GOLD",
     "MERCURY",
+    "ORGANOMERCURY",
+    "PHENYLMERCURY",
     "NICKEL",
     "SILVER",
     "TELLURIUM",
@@ -241,9 +249,32 @@ def aggregate_species_name(value: object) -> str:
 
 def aggregate_class_name(value: object) -> str:
     class_name = normalise_class_name(value)
-    if class_name.upper() in METAL_CLASSES:
-        return "Metals"
+    if class_name.upper() in METAL_LABELS:
+        return "Stress/Metal"
     return class_name
+
+
+def aggregate_concern_group(row: pd.Series) -> str:
+    class_name = normalise_class_name(row.get("class_name", ""))
+    type_name = str(row.get("type_name", "") or "").strip().upper()
+    subtype = str(row.get("subtype", "") or "").strip().upper()
+    class_upper = class_name.upper()
+
+    if type_name == "VIRULENCE":
+        return "Virulence"
+    if type_name == "STRESS":
+        if subtype == "METAL" or class_upper in METAL_LABELS:
+            return "Stress/Metal"
+        if subtype == "BIOCIDE":
+            return "Stress/Biocide"
+        if subtype == "ACID":
+            return "Stress/Acid"
+        if subtype == "HEAT":
+            return "Stress/Heat"
+        raise ValueError(f"Unexpected STRESS subtype for aggregation: {subtype!r}")
+    if class_upper in METAL_LABELS:
+        return "Stress/Metal"
+    return aggregate_class_name(class_name)
 
 
 def normalise_selected(dataframe: pd.DataFrame) -> pd.DataFrame:
@@ -305,6 +336,14 @@ def aggregate_metric_rows(dataframe: pd.DataFrame, label_column: str, mapper: Ca
         return dataframe
     out = dataframe.copy()
     out[label_column] = out[label_column].map(mapper)
+    return merge_metric_rows(out, label_column)
+
+
+def aggregate_metric_rows_by_row(dataframe: pd.DataFrame, label_column: str, mapper: Callable[[pd.Series], str]) -> pd.DataFrame:
+    if dataframe.empty or label_column not in dataframe.columns:
+        return dataframe
+    out = dataframe.copy()
+    out[label_column] = out.apply(mapper, axis=1)
     return merge_metric_rows(out, label_column)
 
 
@@ -648,7 +687,9 @@ def main() -> None:
     species_metrics = merge_metric_rows(normalise_metric_labels(filter_config(read_plot_csv(args.species_metrics), config)), "species")
     class_raw = read_plot_csv(args.class_metrics)
     reject_unresolved_labels(class_raw, "class_name", args.class_metrics)
-    class_metrics = merge_metric_rows(normalise_metric_labels(filter_config(class_raw, config)), "class_name")
+    class_filtered = normalise_metric_labels(filter_config(class_raw, config))
+    class_metrics_for_aggregation = class_filtered
+    class_metrics = merge_metric_rows(class_filtered, "class_name")
     species_class_metrics = None
     if args.species_class_metrics and args.species_class_metrics.exists():
         species_class_raw = read_plot_csv(args.species_class_metrics)
@@ -672,7 +713,11 @@ def main() -> None:
 
     aggregated_selected = aggregate_selected(selected)
     aggregated_species_metrics = aggregate_metric_rows(species_metrics, "species", aggregate_species_name)
-    aggregated_class_metrics = aggregate_metric_rows(class_metrics, "class_name", aggregate_class_name)
+    aggregated_class_metrics = aggregate_metric_rows_by_row(
+        class_metrics_for_aggregation,
+        "class_name",
+        aggregate_concern_group,
+    )
     write_metric_csv(args.out_dir.parent / "species_metrics_aggregated.csv", aggregated_species_metrics)
     write_metric_csv(args.out_dir.parent / "class_metrics_aggregated.csv", aggregated_class_metrics)
     plot_suite(
