@@ -104,10 +104,13 @@ def load_fonts() -> tuple[FontProperties | None, FontProperties | None, FontProp
     return regular, italic or regular, bold or regular
 
 
-def set_text_font(axis: plt.Axes, regular: FontProperties | None) -> None:
+def set_text_font(axis: plt.Axes, regular: FontProperties | None, include_y: bool = True) -> None:
     if not regular:
         return
-    for label in axis.get_xticklabels() + axis.get_yticklabels():
+    labels = axis.get_xticklabels()
+    if include_y:
+        labels += axis.get_yticklabels()
+    for label in labels:
         label.set_fontproperties(regular)
 
 
@@ -142,7 +145,7 @@ def add_headers(axis: plt.Axes, left: str, right: str, regular: FontProperties |
         )
 
 
-def style_axis(axis: plt.Axes, regular: FontProperties | None, minor: bool = True) -> None:
+def style_axis(axis: plt.Axes, regular: FontProperties | None, minor: bool = True, include_y_font: bool = True) -> None:
     axis.tick_params(which="major", direction="in")
     axis.tick_params(which="minor", direction="in")
     axis.xaxis.set_ticks_position("both")
@@ -154,7 +157,7 @@ def style_axis(axis: plt.Axes, regular: FontProperties | None, minor: bool = Tru
         axis.ticklabel_format(useMathText=True, axis="x", scilimits=(-4, 4))
     if regular:
         axis.get_xaxis().get_offset_text().set_fontproperties(regular)
-    set_text_font(axis, regular)
+    set_text_font(axis, regular, include_y=include_y_font)
 
 
 def save_figure(fig: plt.Figure, out_dir: Path, basename: str, formats: list[str]) -> None:
@@ -209,6 +212,8 @@ def aggregate_species_name(value: object) -> str:
         return "Shigella spp."
     if genus == "Enterobacter":
         return "Enterobacter spp."
+    if genus == "Providencia":
+        return "Providencia spp."
     return species
 
 
@@ -236,6 +241,8 @@ def normalise_metric_labels(dataframe: pd.DataFrame) -> pd.DataFrame:
         out["species"] = out["species"].map(normalise_species_name)
     if "class_name" in out.columns:
         out["class_name"] = out["class_name"].map(normalise_class_name)
+    if "type_name" in out.columns:
+        out["type_name"] = out["type_name"].fillna("Unclassified").replace("", "Unclassified")
     return out
 
 
@@ -403,13 +410,14 @@ def metric_plot(
     counts: pd.Series | None = None,
     italic_labels: bool = False,
 ) -> None:
-    required = {label_column, "report_unit_sensitivity", "report_unit_specificity", "report_unit_f1"}
+    required = {label_column, "report_unit_sensitivity", "report_unit_specificity", "report_unit_precision", "report_unit_f1"}
     missing = required - set(dataframe.columns)
     if missing:
         raise SystemExit(f"Metrics file is missing required columns: {', '.join(sorted(missing))}")
     plot_df = dataframe.copy()
     plot_df["report_unit_sensitivity"] = plot_df["report_unit_sensitivity"].map(safe_float)
     plot_df["report_unit_specificity"] = plot_df["report_unit_specificity"].map(safe_float)
+    plot_df["report_unit_precision"] = plot_df["report_unit_precision"].map(safe_float)
     plot_df["report_unit_f1"] = plot_df["report_unit_f1"].map(safe_float)
     labels = plot_df[label_column].astype(str).tolist()
     display_labels = [f"{label} (n={int(counts[label])})" if counts is not None and label in counts.index else label for label in labels]
@@ -418,7 +426,8 @@ def metric_plot(
     fig, ax = plt.subplots(figsize=(8.5, height), dpi=150)
     ax.barh(y, plot_df["report_unit_specificity"], height=0.72, color=RED, alpha=0.45, label="Specificity", zorder=1)
     ax.barh(y, plot_df["report_unit_sensitivity"], height=0.42, color=BLUE, alpha=0.80, label="Sensitivity", zorder=2)
-    ax.scatter(plot_df["report_unit_f1"], y, color=BLACK, s=18, label="F1", zorder=3)
+    ax.scatter(plot_df["report_unit_precision"], y, color=GREY, marker="D", s=18, label="Precision", zorder=4)
+    ax.scatter(plot_df["report_unit_f1"], y, color=BLACK, s=18, label="F1", zorder=5)
     ax.set_yticks(y)
     set_axis_ticklabels(ax, display_labels, regular, italic, italic_labels)
     ax.set_xlim(0.0, 1.0)
@@ -439,7 +448,7 @@ def metric_plot(
         labelspacing=0.3,
     )
     add_headers(ax, title, "Report-unit metrics", regular, italic, bold, preliminary)
-    style_axis(ax, regular)
+    style_axis(ax, regular, include_y_font=not italic_labels)
     save_figure(fig, out_dir, basename, formats)
 
 
@@ -473,7 +482,7 @@ def count_plot(counts: pd.Series, title: str, basename: str, out_dir: Path, form
     ax.set_xlabel("Assemblies", fontproperties=regular, loc="right", fontsize=AXIS_TITLE_SIZE)
     ax.set_ylabel(title, fontproperties=regular, loc="top", fontsize=AXIS_TITLE_SIZE)
     add_headers(ax, title, "Assembly counts", regular, italic, bold, preliminary)
-    style_axis(ax, regular)
+    style_axis(ax, regular, include_y_font=not italic_labels)
     save_figure(fig, out_dir, basename, formats)
 
 
@@ -520,7 +529,7 @@ def stacked_plot(table: pd.DataFrame, title: str, contribution_label: str, basen
     ax.set_xlabel("Assemblies", fontproperties=regular, loc="right", fontsize=AXIS_TITLE_SIZE)
     ax.set_ylabel(title, fontproperties=regular, loc="top", fontsize=AXIS_TITLE_SIZE)
     add_headers(ax, title, f"Stacked by {contribution_label}", regular, italic, bold, preliminary)
-    style_axis(ax, regular, minor=False)
+    style_axis(ax, regular, minor=False, include_y_font=not italic_labels)
     legend = ax.legend(loc="center left", bbox_to_anchor=(1.01, 0.5), frameon=False, prop=regular, fontsize=8, handlelength=0.7, handletextpad=0.5, labelspacing=0.25)
     if italic_contributions and italic:
         for text in legend.get_texts():
@@ -544,6 +553,26 @@ def plot_suite(selected: pd.DataFrame, species_metrics: pd.DataFrame, class_metr
     stacked_plot(apply_order_to_table(table.T, class_order, species_order), "Antibiotic class", "species", f"class_counts_by_species_stacked{suffix}", out_dir, formats, regular, italic, bold, preliminary, italic_contributions=True)
 
 
+def type_metric_plot(type_metrics: pd.DataFrame, out_dir: Path, formats: list[str], regular: FontProperties | None, italic: FontProperties | None, bold: FontProperties | None, preliminary: bool, max_labels: int) -> None:
+    if type_metrics.empty:
+        return
+    ordered = type_metrics.sort_values(["report_unit_f1", "type_name"], ascending=[False, True])
+    if max_labels > 0:
+        ordered = ordered.head(max_labels)
+    metric_plot(
+        ordered.iloc[::-1],
+        "type_name",
+        "AMRFinderPlus type",
+        "report_unit_type_metrics",
+        out_dir,
+        formats,
+        regular,
+        italic,
+        bold,
+        preliminary,
+    )
+
+
 def parse_formats(raw: str) -> list[str]:
     formats = [part.strip().lower().lstrip(".") for part in raw.split(",") if part.strip()]
     return formats or list(DEFAULT_FORMATS)
@@ -556,6 +585,7 @@ def main() -> None:
     parser.add_argument("--species-metrics", type=Path, required=True)
     parser.add_argument("--class-metrics", type=Path, required=True)
     parser.add_argument("--species-class-metrics", type=Path)
+    parser.add_argument("--type-metrics", type=Path)
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--mode")
     parser.add_argument("--k")
@@ -574,11 +604,16 @@ def main() -> None:
     species_class_metrics = None
     if args.species_class_metrics and args.species_class_metrics.exists():
         species_class_metrics = normalise_metric_labels(filter_config(pd.read_csv(args.species_class_metrics), config))
+    type_metrics = None
+    if args.type_metrics and args.type_metrics.exists():
+        type_metrics = normalise_metric_labels(filter_config(pd.read_csv(args.type_metrics), config))
     preliminary = not args.no_preliminary
 
     warn_unclassified_sources(selected, class_metrics, species_class_metrics)
     ensure_dir(args.out_dir)
     plot_suite(selected, species_metrics, class_metrics, args.out_dir, formats, regular, italic, bold, preliminary, args.max_labels)
+    if type_metrics is not None:
+        type_metric_plot(type_metrics, args.out_dir, formats, regular, italic, bold, preliminary, args.max_labels)
 
     aggregated_selected = aggregate_selected(selected)
     aggregated_species_metrics = aggregate_metric_rows(species_metrics, "species", aggregate_species_name)

@@ -88,11 +88,11 @@ def resolve_existing_path(raw: str, base_dir: Path) -> Path:
     return path
 
 
-def amr_rows(path: Path) -> list[dict[str, str]]:
+def reportable_rows(path: Path, included_types: set[str]) -> list[dict[str, str]]:
     return [
         row
         for row in load_tsv(path)
-        if row.get("Type") == "AMR" and row.get("Subtype") == "AMR"
+        if row.get("Type", "").strip().upper() in included_types
     ]
 
 
@@ -136,7 +136,13 @@ def report_map_lookup(rows: list[dict[str, str]]) -> dict[str, str]:
 def metric_universes(
     report_map_rows: list[dict[str, str]],
     hierarchy: dict[str, dict[str, str]],
+    included_types: set[str],
 ) -> dict[str, set[str]]:
+    report_map_rows = [
+        row
+        for row in report_map_rows
+        if row.get("type", "").strip().upper() in included_types
+    ]
     exact = {
         row.get("element_symbol", "")
         for row in report_map_rows
@@ -187,6 +193,21 @@ def normalize_amrfinder(
         "exact": exact,
         "gene_group": sorted(gene_groups),
         "report_unit": sorted(report_units),
+    }
+
+
+def detector_hit_type(hit: dict[str, Any]) -> str:
+    return str(hit.get("type_name") or hit.get("type") or "").strip().upper()
+
+
+def filter_detector_hits_by_type(payload: dict[str, Any], included_types: set[str]) -> dict[str, Any]:
+    return {
+        **payload,
+        "hits": [
+            hit
+            for hit in payload.get("hits", [])
+            if detector_hit_type(hit) in included_types
+        ],
     }
 
 
@@ -278,12 +299,14 @@ def label_value(value: object) -> str:
     return text if text else "Unclassified"
 
 
-def labels_from_amrfinder_rows(rows: list[dict[str, str]], column: str) -> set[str]:
-    return {label_value(row.get(column, "")) for row in rows}
+def labels_from_amrfinder_rows(rows: list[dict[str, str]], column: str, include_blank: bool = False) -> set[str]:
+    labels = {label_value(row.get(column, "")) for row in rows}
+    return labels if include_blank else {label for label in labels if label != "Unclassified"}
 
 
-def labels_from_detector_hits(payload: dict[str, Any], field: str) -> set[str]:
-    return {label_value(hit.get(field)) for hit in payload.get("hits", [])}
+def labels_from_detector_hits(payload: dict[str, Any], field: str, include_blank: bool = False) -> set[str]:
+    labels = {label_value(hit.get(field)) for hit in payload.get("hits", [])}
+    return labels if include_blank else {label for label in labels if label != "Unclassified"}
 
 
 def normalize_detector_hits(
@@ -365,8 +388,10 @@ def main() -> None:
     parser.add_argument("--hierarchy", type=Path)
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--status-csv", type=Path, action="append", required=True)
+    parser.add_argument("--include-types", default="AMR,STRESS,VIRULENCE")
     args = parser.parse_args()
 
+    included_types = {value.strip().upper() for value in args.include_types.split(",") if value.strip()}
     hierarchy = load_hierarchy(args.hierarchy)
     amrfinder_status = {}
     for row in read_csv(args.amrfinder_status):
@@ -389,13 +414,14 @@ def main() -> None:
             continue
         rows = load_report_map_rows(report_map_path(args.report_map_root, key[0], key[1]))
         report_map_by_key[key] = report_map_lookup(rows)
-        universes_by_key[key] = metric_universes(rows, hierarchy)
+        universes_by_key[key] = metric_universes(rows, hierarchy, included_types)
 
     aggregate_rows = []
     species_rows = []
     class_rows = []
     subclass_rows = []
     species_class_rows = []
+    type_rows = []
 
     for status_csv in status_paths:
         params = params_by_status[status_csv]
@@ -408,9 +434,11 @@ def main() -> None:
         class_items = []
         subclass_items = []
         species_class_items = []
+        type_items = []
         class_universes: dict[str, dict[str, set[str]]] = collections.defaultdict(empty_universes)
         subclass_universes: dict[str, dict[str, set[str]]] = collections.defaultdict(empty_universes)
         species_class_universes: dict[str, dict[str, set[str]]] = collections.defaultdict(empty_universes)
+        type_universes: dict[str, dict[str, set[str]]] = collections.defaultdict(empty_universes)
         per_assembly = []
         missing_native_class = 0
         missing_detector_class = 0
@@ -421,9 +449,9 @@ def main() -> None:
             if not baseline_row or row.get("detector_status") not in {"ok", "cached"}:
                 continue
 
-            native_rows = amr_rows(Path(baseline_row["tsv_path"]))
+            native_rows = reportable_rows(Path(baseline_row["tsv_path"]), included_types)
             detector_json_path = resolve_existing_path(row["detector_json"], status_csv.parent)
-            detector_payload = load_json(detector_json_path)
+            detector_payload = filter_detector_hits_by_type(load_json(detector_json_path), included_types)
             missing_native_class += sum(1 for native_row in native_rows if not str(native_row.get("Class", "")).strip())
             missing_detector_class += sum(1 for hit in detector_payload.get("hits", []) if not str(hit.get("class_name", "") or "").strip())
             baseline_norm = normalize_amrfinder(native_rows, report_map, hierarchy)
@@ -433,6 +461,12 @@ def main() -> None:
 
             species = row.get("species", "") or "Unknown species"
             add_counts(species_micro[species], row_counts)
+
+            for type_label in labels_from_amrfinder_rows(native_rows, "Type") | labels_from_detector_hits(detector_payload, "type_name"):
+                type_baseline = normalize_amrfinder(filter_native_rows(native_rows, "Type", type_label), report_map, hierarchy)
+                type_detector = normalize_detector_hits(filter_detector_hits(detector_payload, "type_name", type_label), hierarchy)
+                type_items.append((type_label, type_detector, type_baseline))
+                update_universe(type_universes[type_label], type_detector, type_baseline)
 
             for class_label in labels_from_amrfinder_rows(native_rows, "Class") | labels_from_detector_hits(detector_payload, "class_name"):
                 class_baseline = normalize_amrfinder(filter_native_rows(native_rows, "Class", class_label), report_map, hierarchy)
@@ -497,6 +531,10 @@ def main() -> None:
         for label, detector_norm, baseline_norm in species_class_items:
             add_counts(species_class_micro[label], metric_counts(detector_norm, baseline_norm, species_class_universes[label]))
 
+        type_micro: dict[str, collections.Counter[str]] = collections.defaultdict(collections.Counter)
+        for label, detector_norm, baseline_norm in type_items:
+            add_counts(type_micro[label], metric_counts(detector_norm, baseline_norm, type_universes[label]))
+
         out_name = (
             f"{params['mode']}_k_{params['k']}_"
             f"{params['threshold_mode']}_gene_{params['min_gene_threshold']}_"
@@ -504,20 +542,22 @@ def main() -> None:
         )
         write_csv(args.out_dir / out_name, list(per_assembly[0].keys()) if per_assembly else [], per_assembly)
         if missing_native_class:
-            print(f"Warning: {missing_native_class} AMRFinderPlus rows had blank Class values and were assigned Unclassified for {status_csv}.")
+            print(f"Warning: {missing_native_class} AMRFinderPlus rows had blank Class values and were omitted from class-level metrics for {status_csv}.")
         if missing_detector_class:
-            print(f"Warning: {missing_detector_class} detector hits had blank class_name values and were assigned Unclassified for {status_csv}.")
+            print(f"Warning: {missing_detector_class} detector hits had blank class_name values and were omitted from class-level metrics for {status_csv}.")
         aggregate_rows.append(metric_row(params, micro))
         species_rows.extend(grouped_rows(species_micro, params, ("species",)))
         class_rows.extend(grouped_rows(class_micro, params, ("class_name",)))
         subclass_rows.extend(grouped_rows(subclass_micro, params, ("subclass",)))
         species_class_rows.extend(grouped_rows(species_class_micro, params, ("species", "class_name")))
+        type_rows.extend(grouped_rows(type_micro, params, ("type_name",)))
 
     write_csv(args.out_dir / "aggregate_metrics.csv", list(aggregate_rows[0].keys()) if aggregate_rows else [], aggregate_rows)
     write_csv(args.out_dir / "species_metrics.csv", list(species_rows[0].keys()) if species_rows else [], species_rows)
     write_csv(args.out_dir / "class_metrics.csv", list(class_rows[0].keys()) if class_rows else [], class_rows)
     write_csv(args.out_dir / "subclass_metrics.csv", list(subclass_rows[0].keys()) if subclass_rows else [], subclass_rows)
     write_csv(args.out_dir / "species_class_metrics.csv", list(species_class_rows[0].keys()) if species_class_rows else [], species_class_rows)
+    write_csv(args.out_dir / "type_metrics.csv", list(type_rows[0].keys()) if type_rows else [], type_rows)
 
 
 if __name__ == "__main__":

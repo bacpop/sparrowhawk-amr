@@ -50,6 +50,7 @@ uv --directory "$BENCHMARK_DIR" run amr-compare-amrfinder-batch \
   --detector-root "$DETECTOR_OUT" \
   --report-map-root "$REPORT_MAP_ROOT" \
   --hierarchy "$HIERARCHY" \
+  --include-types "$INCLUDE_TYPES" \
   --out-dir "$COMPARISON_OUT" \
   "${STATUS_ARGS[@]}"
 
@@ -73,6 +74,7 @@ uv --directory "$BENCHMARK_DIR" run amr-plot-results \
   --species-metrics "$COMPARISON_OUT/species_metrics.csv" \
   --class-metrics "$COMPARISON_OUT/class_metrics.csv" \
   --species-class-metrics "$COMPARISON_OUT/species_class_metrics.csv" \
+  --type-metrics "$COMPARISON_OUT/type_metrics.csv" \
   --out-dir "$COMPARISON_OUT/plots"
 
 echo "Collecting index stats..."
@@ -90,6 +92,7 @@ echo "  Aggregate metrics:      $COMPARISON_OUT/aggregate_metrics.csv"
 echo "  Species metrics:        $COMPARISON_OUT/species_metrics.csv"
 echo "  Class metrics:          $COMPARISON_OUT/class_metrics.csv"
 echo "  Subclass metrics:       $COMPARISON_OUT/subclass_metrics.csv"
+echo "  Type metrics:           $COMPARISON_OUT/type_metrics.csv"
 echo "  Species-class metrics:  $COMPARISON_OUT/species_class_metrics.csv"
 echo "  Summary:                $COMPARISON_OUT/summary.md"
 echo "  Plots:                  $COMPARISON_OUT/plots"
