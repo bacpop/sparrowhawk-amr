@@ -82,7 +82,6 @@ impl Default for IndexAlphabet {
     }
 }
 
-
 // Struct to work with per-gene info: this is temporal, but used for debugging!
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeneEntry {
@@ -104,7 +103,6 @@ pub struct GeneEntry {
     pub report_unit_id: UnitId,
     pub exact_unit_eligible: bool,
 }
-
 
 // Struct that will become part of the index
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -259,7 +257,6 @@ impl AmrIndex {
     }
 }
 
-
 fn format_counts<'a>(values: impl Iterator<Item = &'a str>) -> String {
     let mut counts = BTreeMap::<String, usize>::new();
     for value in values {
@@ -274,13 +271,11 @@ fn format_counts<'a>(values: impl Iterator<Item = &'a str>) -> String {
         .join(",")
 }
 
-
 /// Constructs the index
 pub fn build_index(
     references: &[AmrReference],
     config: &IndexBuildConfig,
 ) -> anyhow::Result<AmrIndex> {
-
     // First, initsssss
     match config.alphabet {
         IndexAlphabet::Dna => ensure!(
@@ -309,7 +304,12 @@ pub fn build_index(
         } else {
             reference.allele_symbol.clone()
         };
-        let path = normalized_path(reference); // Just create one if there is none
+        let path = normalized_path(reference).with_context(|| {
+            format!(
+                "normalise hierarchy path for protein_accession='{}', element_symbol='{}'",
+                reference.protein_accession, reference.element_symbol
+            )
+        })?;
         for node in &path {
             node_meta
                 .entry(node.node_id.clone())
@@ -352,7 +352,6 @@ pub fn build_index(
             }
         }
     }
-
 
     // Now, let's start getting values for setting the report units.
     // First, gene unique counts
@@ -480,7 +479,6 @@ pub fn build_index(
     })
 }
 
-
 #[cfg(not(target_family = "wasm"))]
 pub fn save_index(index: &AmrIndex, path: &Path) -> anyhow::Result<()> {
     let bytes = bincode::serialize(index).context("serialize AMR index")?;
@@ -528,7 +526,6 @@ fn reference_kmers(seq: &[u8], k: usize, alphabet: IndexAlphabet) -> Option<Vec<
     }
 }
 
-
 #[derive(Debug, Clone)]
 struct NodeMeta {
     label: String,
@@ -554,28 +551,22 @@ impl NodeMeta {
     }
 }
 
-fn normalized_path(reference: &AmrReference) -> Vec<HierarchyNode> {
-    if !reference.hierarchy_path.is_empty() {
-        return reference.hierarchy_path.clone();
-    }
-    let node_id = first_non_empty([
-        reference.hierarchy_node.as_str(),
-        reference.family.as_str(),
-        reference.element_symbol.as_str(),
-    ]);
-    vec![HierarchyNode {
-        node_id: node_id.to_string(),
-        parent_node_id: String::new(),
-        symbol: node_id.to_string(),
-        class_name: reference.class_name.clone(),
-        subclass: reference.subclass.clone(),
-        scope: reference.scope.clone(),
-        type_name: reference.type_name.clone(),
-        subtype: reference.subtype.clone(),
-        reportable: reference.reportable,
-    }]
+fn normalized_path(reference: &AmrReference) -> anyhow::Result<Vec<HierarchyNode>> {
+    ensure!(
+        !reference.hierarchy_path.is_empty(),
+        "empty hierarchy path for reference protein_accession='{}', element_symbol='{}', gene_symbol='{}', hierarchy_node='{}', family='{}', type='{}', subtype='{}', class='{}', subclass='{}'",
+        reference.protein_accession,
+        reference.element_symbol,
+        reference.gene_symbol,
+        reference.hierarchy_node,
+        reference.family,
+        reference.type_name,
+        reference.subtype,
+        reference.class_name,
+        reference.subclass
+    );
+    Ok(reference.hierarchy_path.clone())
 }
-
 
 /// Get the counts for all nodes that might be susceptible of giving a report unit over a single gene/allele
 /// (i.e. ignoring those that we can call directly).
@@ -595,7 +586,6 @@ fn hierarchy_candidate_counts(
     }
     counts
 }
-
 
 /// Main function for selecting which other superior hierarchy units we choose
 fn select_hierarchy_units(
@@ -623,7 +613,8 @@ fn select_hierarchy_units(
                     >= min_hierarchy_unit_kmers
             })
             .cloned()
-            .or_else(|| { // If not a suitable one has been found, let's get the largest one possible
+            .or_else(|| {
+                // If not a suitable one has been found, let's get the largest one possible
                 path.iter()
                     .max_by_key(|node_id| {
                         node_candidate_counts
@@ -669,7 +660,14 @@ fn hierarchy_unit(
     min_hierarchy_unit_kmers: usize,
     interner: &mut StringInterner,
 ) -> anyhow::Result<ReportUnit> {
-    let meta = node_meta.get(node_id);
+    let meta = node_meta.get(node_id).ok_or_else(|| {
+        anyhow::anyhow!(
+            "selected hierarchy unit '{}' has no node metadata; member_gene_ids={:?}; candidate_count={}",
+            node_id,
+            node_to_genes.get(node_id),
+            node_candidate_counts.get(node_id).copied().unwrap_or_default()
+        )
+    })?;
     let mut member_gene_ids: Vec<GeneId> = node_to_genes
         .get(node_id)
         .into_iter()
@@ -681,22 +679,29 @@ fn hierarchy_unit(
         .get(node_id)
         .copied()
         .unwrap_or_default();
+    ensure!(
+        !meta.class_name.trim().is_empty()
+            && !meta.subclass.trim().is_empty()
+            && !meta.type_name.trim().is_empty()
+            && !meta.subtype.trim().is_empty(),
+        "selected hierarchy unit '{}' has incomplete metadata: {:?}",
+        node_id,
+        meta
+    );
+
     Ok(ReportUnit {
         id: interner.intern(node_id)?,
-        label: interner.intern(meta.map(|meta| meta.label.as_str()).unwrap_or(node_id))?,
+        label: interner.intern(&meta.label)?,
         gene_id: None,
         element_symbol: None,
         gene_symbol: None,
         allele_symbol: None,
         gene_group: interner.intern(node_id)?,
         hierarchy_node: interner.intern(node_id)?,
-        class_name: interner.intern(
-            meta.map(|meta| meta.class_name.as_str())
-                .unwrap_or_default(),
-        )?,
-        subclass: interner.intern(meta.map(|meta| meta.subclass.as_str()).unwrap_or_default())?,
-        type_name: interner.intern(meta.map(|meta| meta.type_name.as_str()).unwrap_or_default())?,
-        subtype: interner.intern(meta.map(|meta| meta.subtype.as_str()).unwrap_or_default())?,
+        class_name: interner.intern(&meta.class_name)?,
+        subclass: interner.intern(&meta.subclass)?,
+        type_name: interner.intern(&meta.type_name)?,
+        subtype: interner.intern(&meta.subtype)?,
         product: interner.intern("")?,
         member_count: member_gene_ids.len(),
         member_gene_ids,
@@ -748,7 +753,6 @@ fn fill_unit_ancestors(
     }
 }
 
-
 fn lowest_selected_hierarchy_unit(
     refs: &[usize],
     gene_paths: &[Vec<String>],
@@ -758,7 +762,6 @@ fn lowest_selected_hierarchy_unit(
         .into_iter()
         .find_map(|node_id| node_unit_ids.get(&node_id).copied())
 }
-
 
 /// S
 fn common_path_nodes(refs: &[usize], gene_paths: &[Vec<String>]) -> Vec<String> {
@@ -776,15 +779,6 @@ fn common_path_nodes(refs: &[usize], gene_paths: &[Vec<String>]) -> Vec<String> 
         .collect()
 }
 
-fn first_non_empty<'a>(values: [&'a str; 3]) -> &'a str {
-    values
-        .into_iter()
-        .find(|value| !value.is_empty())
-        .unwrap_or("")
-}
-
-
-
 // =============================================== TESTs
 
 #[cfg(test)]
@@ -800,8 +794,8 @@ mod tests {
             allele_symbol: id.to_string(),
             product: String::new(),
             family: node.to_string(),
-            class_name: String::new(),
-            subclass: String::new(),
+            class_name: "CLASS".to_string(),
+            subclass: "SUBCLASS".to_string(),
             hierarchy_node: String::new(),
             scope: "core".to_string(),
             type_name: "AMR".to_string(),
@@ -811,8 +805,8 @@ mod tests {
                 node_id: node.to_string(),
                 parent_node_id: String::new(),
                 symbol: node.to_string(),
-                class_name: String::new(),
-                subclass: String::new(),
+                class_name: "CLASS".to_string(),
+                subclass: "SUBCLASS".to_string(),
                 scope: "core".to_string(),
                 type_name: "AMR".to_string(),
                 subtype: "AMR".to_string(),

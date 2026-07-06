@@ -300,7 +300,7 @@ fn load_amrfinder_references_from_fasta(
             .copied()
             .or(meta.reportable)
             .unwrap_or(0);
-        let ref_hierarchy_path = hierarchy_path(&effective_node, &hierarchy_nodes, meta);
+        let ref_hierarchy_path = hierarchy_path(&effective_node, &hierarchy_nodes, meta)?;
         let gene_symbol = if catalog.gene_family.is_empty() {
             meta.symbol.clone()
         } else {
@@ -345,7 +345,6 @@ fn load_amrfinder_references_from_fasta(
     Ok(references)
 }
 
-
 // Helper/other functions that serve to parse essentially, solve some issues that can happen, etc.
 fn fallback_element_symbol(
     allele_symbol: &str,
@@ -365,7 +364,6 @@ fn fallback_element_symbol(
     hierarchy_node.to_string()
 }
 
-
 fn fallback_family(gene_symbol: &str, hierarchy_symbol: &str, hierarchy_node: &str) -> String {
     if !gene_symbol.is_empty() {
         return gene_symbol.to_string();
@@ -375,7 +373,6 @@ fn fallback_family(gene_symbol: &str, hierarchy_symbol: &str, hierarchy_node: &s
     }
     hierarchy_node.to_string()
 }
-
 
 fn parse_reference_header(
     record: &FastaRecord,
@@ -408,7 +405,6 @@ fn parse_header_usize(value: &str, source_label: &str, field_name: &str) -> anyh
         .parse::<usize>()
         .with_context(|| format!("parse {} {} value '{}'", source_label, field_name, value))
 }
-
 
 fn resolve_effective_node(
     header: &ReferenceHeader,
@@ -448,7 +444,6 @@ fn resolve_effective_node(
     ))
 }
 
-
 /// This just checks that there is no issue with a particular nt accession, by reviewing that there is an entry in the catalog
 fn validate_nucleotide_accession(
     header: &ReferenceHeader,
@@ -477,7 +472,6 @@ fn validate_nucleotide_accession(
     ))
 }
 
-
 fn load_node_metadata(db_dir: &Path) -> anyhow::Result<HashMap<String, NodeMetadata>> {
     let path = db_dir.join("ReferenceGeneHierarchy.txt");
     let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
@@ -497,24 +491,33 @@ fn load_node_metadata(db_dir: &Path) -> anyhow::Result<HashMap<String, NodeMetad
         if node_id.is_empty() {
             continue;
         }
+        let type_name = field(&fields, &columns, "type");
+        let subtype = field(&fields, &columns, "subtype");
         map.insert(
             node_id.to_string(),
             NodeMetadata {
                 node_id: node_id.to_string(),
                 parent_node_id: field(&fields, &columns, "parent_node_id").to_string(),
                 symbol: field(&fields, &columns, "symbol").to_string(),
-                class_name: field(&fields, &columns, "class").to_string(),
-                subclass: field(&fields, &columns, "subclass").to_string(),
+                class_name: plus_label_fallback(
+                    type_name,
+                    field(&fields, &columns, "class"),
+                    subtype,
+                ),
+                subclass: plus_label_fallback(
+                    type_name,
+                    field(&fields, &columns, "subclass"),
+                    subtype,
+                ),
                 scope: field(&fields, &columns, "scope").to_string(),
-                type_name: field(&fields, &columns, "type").to_string(),
-                subtype: field(&fields, &columns, "subtype").to_string(),
+                type_name: type_name.to_string(),
+                subtype: subtype.to_string(),
                 reportable: reportability.get(node_id).copied(),
             },
         );
     }
     Ok(map)
 }
-
 
 fn load_fam_reportability(db_dir: &Path) -> anyhow::Result<HashMap<String, u8>> {
     let path = db_dir.join("fam.tsv");
@@ -551,7 +554,6 @@ fn load_fam_reportability(db_dir: &Path) -> anyhow::Result<HashMap<String, u8>> 
     }
     Ok(reportability)
 }
-
 
 fn load_protein_reportability(db_dir: &Path) -> anyhow::Result<HashMap<String, u8>> {
     let path = db_dir.join("AMRProt.fa");
@@ -590,7 +592,6 @@ fn load_protein_reportability(db_dir: &Path) -> anyhow::Result<HashMap<String, u
     Ok(reportability)
 }
 
-
 fn load_catalog_entries(db_dir: &Path) -> anyhow::Result<HashMap<String, CatalogEntry>> {
     let path = db_dir.join("ReferenceGeneCatalog.txt");
     let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
@@ -624,7 +625,7 @@ fn load_catalog_entries(db_dir: &Path) -> anyhow::Result<HashMap<String, Catalog
         if !is_exact_reference_catalog_row(&row) {
             continue;
         }
-        let entry = CatalogEntry::from_row(&row);
+        let entry = CatalogEntry::from_row(&row)?;
         insert_catalog_entry(&mut entries_by_refseq, row.refseq_protein_accession, &entry)?;
         insert_catalog_entry(
             &mut entries_by_genbank,
@@ -663,6 +664,8 @@ fn load_hierarchy_nodes(db_dir: &Path) -> anyhow::Result<HashMap<String, Hierarc
             continue;
         }
 
+        let type_name = field(&fields, &columns, "type");
+        let subtype = field(&fields, &columns, "subtype");
         nodes.insert(
             node_id.to_string(),
             HierarchyNode {
@@ -673,11 +676,19 @@ fn load_hierarchy_nodes(db_dir: &Path) -> anyhow::Result<HashMap<String, Hierarc
                     node_id,
                     field(&fields, &columns, "name"),
                 ]),
-                class_name: field(&fields, &columns, "class").to_string(),
-                subclass: field(&fields, &columns, "subclass").to_string(),
+                class_name: plus_label_fallback(
+                    type_name,
+                    field(&fields, &columns, "class"),
+                    subtype,
+                ),
+                subclass: plus_label_fallback(
+                    type_name,
+                    field(&fields, &columns, "subclass"),
+                    subtype,
+                ),
                 scope: field(&fields, &columns, "scope").to_string(),
-                type_name: field(&fields, &columns, "type").to_string(),
-                subtype: field(&fields, &columns, "subtype").to_string(),
+                type_name: type_name.to_string(),
+                subtype: subtype.to_string(),
                 reportable: reportability.get(node_id).copied().unwrap_or(0),
             },
         );
@@ -685,39 +696,117 @@ fn load_hierarchy_nodes(db_dir: &Path) -> anyhow::Result<HashMap<String, Hierarc
     Ok(nodes)
 }
 
-
 /// This gives you the branch as a vector of nodes up to the top
 fn hierarchy_path(
     leaf_node_id: &str,
     nodes: &HashMap<String, HierarchyNode>,
     meta: &NodeMetadata,
-) -> Vec<HierarchyNode> {
+) -> anyhow::Result<Vec<HierarchyNode>> {
+    ensure!(
+        !leaf_node_id.trim().is_empty(),
+        "empty hierarchy leaf node for metadata {:?}",
+        meta
+    );
+
     let mut path = Vec::new();
     let mut seen = HashSet::new();
     let mut current = leaf_node_id;
-    while !current.is_empty() && seen.insert(current.to_string()) {
+    while !current.is_empty() {
+        ensure!(
+            seen.insert(current.to_string()),
+            "cycle in ReferenceGeneHierarchy.txt while walking '{}': {}",
+            leaf_node_id,
+            hierarchy_diagnostic(current, nodes)
+        );
         let Some(node) = nodes.get(current) else {
-            break;
+            return Err(anyhow!(
+                "missing hierarchy node '{}' while walking '{}': {}",
+                current,
+                leaf_node_id,
+                hierarchy_diagnostic(current, nodes)
+            ));
         };
         path.push(node.clone());
         current = &node.parent_node_id;
     }
-    if path.is_empty() && !leaf_node_id.is_empty() {
-        path.push(HierarchyNode {
-            node_id: leaf_node_id.to_string(),
-            parent_node_id: String::new(),
-            symbol: first_non_empty([&meta.symbol, leaf_node_id, ""]),
-            class_name: meta.class_name.clone(),
-            subclass: meta.subclass.clone(),
-            scope: meta.scope.clone(),
-            type_name: meta.type_name.clone(),
-            subtype: meta.subtype.clone(),
-            reportable: meta.reportable.unwrap_or(0),
-        });
-    }
-    path
+
+    ensure!(
+        !path.is_empty(),
+        "empty hierarchy path for '{}': {}",
+        leaf_node_id,
+        hierarchy_diagnostic(leaf_node_id, nodes)
+    );
+    Ok(path)
 }
 
+fn hierarchy_diagnostic(node_id: &str, nodes: &HashMap<String, HierarchyNode>) -> String {
+    let mut children: HashMap<&str, Vec<&HierarchyNode>> = HashMap::new();
+    for node in nodes.values() {
+        children
+            .entry(node.parent_node_id.as_str())
+            .or_default()
+            .push(node);
+    }
+
+    let node = nodes.get(node_id);
+    let parent_id = node.map(|node| node.parent_node_id.as_str()).unwrap_or("");
+    let parent = if parent_id.is_empty() {
+        None
+    } else {
+        nodes.get(parent_id)
+    };
+
+    let mut siblings = if parent_id.is_empty() {
+        Vec::new()
+    } else {
+        children.get(parent_id).cloned().unwrap_or_default()
+    };
+    siblings.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+
+    let mut descendants = Vec::new();
+    let mut seen = HashSet::new();
+    collect_descendants(node_id, &children, &mut descendants, &mut seen);
+    descendants.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+
+    format!(
+        "node={:?}; parent={:?}; siblings={:?}; descendants={:?}",
+        node.map(format_node),
+        parent.map(format_node),
+        siblings.into_iter().map(format_node).collect::<Vec<_>>(),
+        descendants.into_iter().map(format_node).collect::<Vec<_>>()
+    )
+}
+
+fn collect_descendants<'a>(
+    node_id: &str,
+    children: &HashMap<&'a str, Vec<&'a HierarchyNode>>,
+    out: &mut Vec<&'a HierarchyNode>,
+    seen: &mut HashSet<String>,
+) {
+    if !seen.insert(node_id.to_string()) {
+        return;
+    }
+    if let Some(kids) = children.get(node_id) {
+        for child in kids {
+            out.push(*child);
+            collect_descendants(child.node_id.as_str(), children, out, seen);
+        }
+    }
+}
+
+fn format_node(node: &HierarchyNode) -> String {
+    format!(
+        "{{node_id='{}', parent='{}', symbol='{}', type='{}', subtype='{}', class='{}', subclass='{}', reportable={}}}",
+        node.node_id,
+        node.parent_node_id,
+        node.symbol,
+        node.type_name,
+        node.subtype,
+        node.class_name,
+        node.subclass,
+        node.reportable
+    )
+}
 
 fn columns(header: &str) -> HashMap<String, usize> {
     header
@@ -745,8 +834,28 @@ fn first_non_empty(values: [&str; 3]) -> String {
         .to_string()
 }
 
+fn is_missing_amrfinder_label(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("NA")
+        || trimmed.eq_ignore_ascii_case("Unclassified")
+}
+
+fn plus_label_fallback(type_name: &str, label: &str, subtype: &str) -> String {
+    if is_missing_amrfinder_label(label)
+        && !type_name.eq_ignore_ascii_case("AMR")
+        && !is_missing_amrfinder_label(subtype)
+    {
+        subtype.trim().to_string()
+    } else {
+        label.trim().to_string()
+    }
+}
+
 impl CatalogEntry {
-    fn from_row(row: &CatalogRow<'_>) -> Self {
+    fn from_row(row: &CatalogRow<'_>) -> anyhow::Result<Self> {
+        let class_name = plus_label_fallback(row.type_name, row.class_name, row.subtype);
+        let subclass = plus_label_fallback(row.type_name, row.subclass, row.subtype);
         let mut entry = Self {
             hierarchy_node: row.hierarchy_node.to_string(),
             gene_family: row.gene_family.to_string(),
@@ -755,8 +864,8 @@ impl CatalogEntry {
             scope: row.scope.to_string(),
             type_name: row.type_name.to_string(),
             subtype: row.subtype.to_string(),
-            class_name: row.class_name.to_string(),
-            subclass: row.subclass.to_string(),
+            class_name,
+            subclass,
             refseq_nucleotide_accessions: BTreeSet::new(),
             genbank_nucleotide_accessions: BTreeSet::new(),
             genbank_protein_accessions: BTreeSet::new(),
@@ -776,7 +885,7 @@ impl CatalogEntry {
                 .genbank_protein_accessions
                 .insert(row.genbank_protein_accession.to_string());
         }
-        entry
+        Ok(entry)
     }
 }
 
@@ -851,8 +960,6 @@ fn insert_catalog_alias(
     map.insert(key.to_string(), entry.clone());
     Ok(())
 }
-
-
 
 // ======================================================== TESTS
 #[cfg(test)]
@@ -1048,11 +1155,14 @@ mod tests {
     }
 
     #[test]
-    fn hierarchy_path_uses_node_metadata_fallback() {
-        let path = hierarchy_path("stxA2b", &HashMap::new(), &sample_node_metadata());
-        assert_eq!(path.len(), 1);
-        assert_eq!(path[0].node_id, "stxA2b");
-        assert_eq!(path[0].symbol, "stxA2b");
+    fn hierarchy_path_rejects_missing_node_with_diagnostics() {
+        let err = hierarchy_path("stxA2b", &HashMap::new(), &sample_node_metadata()).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("missing hierarchy node 'stxA2b'"));
+        assert!(message.contains("node="));
+        assert!(message.contains("parent="));
+        assert!(message.contains("siblings="));
+        assert!(message.contains("descendants="));
     }
 
     #[test]
@@ -1060,12 +1170,14 @@ mod tests {
         let mut existing = CatalogEntry::from_row(&CatalogRow {
             genbank_nucleotide_accession: "AY443052.1",
             ..sample_catalog_row("WP_000649751.1")
-        });
+        })
+        .unwrap();
         let incoming = CatalogEntry::from_row(&CatalogRow {
             genbank_nucleotide_accession: "AB015057.1",
             genbank_protein_accession: "BAA34372.1",
             ..sample_catalog_row("WP_000649751.1")
-        });
+        })
+        .unwrap();
         merge_catalog_entry(&mut existing, &incoming).unwrap();
         assert!(
             existing
@@ -1135,11 +1247,12 @@ mod tests {
 
     #[test]
     fn merge_catalog_entry_rejects_biological_conflicts() {
-        let mut existing = CatalogEntry::from_row(&sample_catalog_row("WP_000649751.1"));
+        let mut existing = CatalogEntry::from_row(&sample_catalog_row("WP_000649751.1")).unwrap();
         let incoming = CatalogEntry::from_row(&CatalogRow {
             hierarchy_node: "different_node",
             ..sample_catalog_row("WP_000649751.1")
-        });
+        })
+        .unwrap();
         let err = merge_catalog_entry(&mut existing, &incoming).unwrap_err();
         assert!(err.to_string().contains("existing="));
     }

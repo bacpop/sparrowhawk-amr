@@ -167,6 +167,28 @@ def save_figure(fig: plt.Figure, out_dir: Path, basename: str, formats: list[str
     plt.close(fig)
 
 
+def write_metric_csv(path: Path, dataframe: pd.DataFrame) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    dataframe.to_csv(path, index=False)
+
+
+def read_plot_csv(path: Path) -> pd.DataFrame:
+    return pd.read_csv(path, keep_default_na=False)
+
+
+def reject_unresolved_labels(dataframe: pd.DataFrame, column: str, path: Path) -> None:
+    if column not in dataframe.columns:
+        return
+    labels = dataframe[column].astype(str).str.strip().str.upper()
+    bad = labels.isin({"", "NA", "UNCLASSIFIED"})
+    if bad.any():
+        examples = dataframe.loc[bad, column].head(5).astype(str).tolist()
+        raise SystemExit(
+            f"{path} contains unresolved {column} labels {examples}; "
+            "rerun comparison after subtype fallback"
+        )
+
+
 def safe_float(value: object) -> float:
     try:
         return float(value)
@@ -318,6 +340,21 @@ def ordered_labels_from_counts(counts: pd.Series, max_labels: int) -> list[str]:
     return [str(label) for label in ordered.index]
 
 
+def append_metric_only_labels(order: list[str], dataframe: pd.DataFrame, label_column: str, max_labels: int) -> list[str]:
+    seen = set(order)
+    extra = []
+    if label_column not in dataframe.columns:
+        return order
+    for label in dataframe[label_column].dropna().astype(str):
+        if label not in seen:
+            seen.add(label)
+            extra.append(label)
+    if max_labels > 0:
+        available = max(0, max_labels - len(order))
+        extra = extra[:available]
+    return order + extra
+
+
 def apply_order_to_metric_rows(dataframe: pd.DataFrame, label_column: str, order: list[str]) -> pd.DataFrame:
     if dataframe.empty:
         return dataframe
@@ -420,7 +457,14 @@ def metric_plot(
     plot_df["report_unit_precision"] = plot_df["report_unit_precision"].map(safe_float)
     plot_df["report_unit_f1"] = plot_df["report_unit_f1"].map(safe_float)
     labels = plot_df[label_column].astype(str).tolist()
-    display_labels = [f"{label} (n={int(counts[label])})" if counts is not None and label in counts.index else label for label in labels]
+    display_labels = []
+    for label, (_, row) in zip(labels, plot_df.iterrows()):
+        if counts is not None and label in counts.index:
+            display_labels.append(f"{label} (n={int(counts[label])})")
+        elif "assemblies_compared" in row.index:
+            display_labels.append(f"{label} (n={int(row['assemblies_compared'])})")
+        else:
+            display_labels.append(label)
     y = np.arange(len(labels))
     height = max(4.0, 0.31 * len(labels) + 1.6)
     fig, ax = plt.subplots(figsize=(8.5, height), dpi=150)
@@ -542,6 +586,8 @@ def plot_suite(selected: pd.DataFrame, species_metrics: pd.DataFrame, class_metr
     class_count_values = class_counts(selected)
     species_order = ordered_labels_from_counts(species_count_values, max_labels)
     class_order = ordered_labels_from_counts(class_count_values, max_labels)
+    species_order = append_metric_only_labels(species_order, species_metrics, "species", max_labels)
+    class_order = append_metric_only_labels(class_order, class_metrics, "class_name", max_labels)
     species_table = apply_order_to_metric_rows(species_metrics, "species", species_order)
     class_table = apply_order_to_metric_rows(class_metrics, "class_name", class_order)
     metric_plot(species_table.iloc[::-1], "species", "Species", f"report_unit_species_metrics{suffix}", out_dir, formats, regular, italic, bold, preliminary, species_count_values, italic_labels=True)
@@ -596,28 +642,39 @@ def main() -> None:
 
     formats = parse_formats(args.out_formats)
     regular, italic, bold = load_fonts()
-    aggregate = pd.read_csv(args.aggregate_metrics) if args.aggregate_metrics and args.aggregate_metrics.exists() else None
+    aggregate = read_plot_csv(args.aggregate_metrics) if args.aggregate_metrics and args.aggregate_metrics.exists() else None
     config = choose_config(aggregate, args.mode, args.k)
-    selected = normalise_selected(pd.read_csv(args.selected_manifest))
-    species_metrics = merge_metric_rows(normalise_metric_labels(filter_config(pd.read_csv(args.species_metrics), config)), "species")
-    class_metrics = merge_metric_rows(normalise_metric_labels(filter_config(pd.read_csv(args.class_metrics), config)), "class_name")
+    selected = normalise_selected(read_plot_csv(args.selected_manifest))
+    species_metrics = merge_metric_rows(normalise_metric_labels(filter_config(read_plot_csv(args.species_metrics), config)), "species")
+    class_raw = read_plot_csv(args.class_metrics)
+    reject_unresolved_labels(class_raw, "class_name", args.class_metrics)
+    class_metrics = merge_metric_rows(normalise_metric_labels(filter_config(class_raw, config)), "class_name")
     species_class_metrics = None
     if args.species_class_metrics and args.species_class_metrics.exists():
-        species_class_metrics = normalise_metric_labels(filter_config(pd.read_csv(args.species_class_metrics), config))
+        species_class_raw = read_plot_csv(args.species_class_metrics)
+        reject_unresolved_labels(species_class_raw, "class_name", args.species_class_metrics)
+        species_class_metrics = normalise_metric_labels(filter_config(species_class_raw, config))
     type_metrics = None
     if args.type_metrics and args.type_metrics.exists():
-        type_metrics = normalise_metric_labels(filter_config(pd.read_csv(args.type_metrics), config))
+        type_metrics = normalise_metric_labels(filter_config(read_plot_csv(args.type_metrics), config))
     preliminary = not args.no_preliminary
 
     warn_unclassified_sources(selected, class_metrics, species_class_metrics)
     ensure_dir(args.out_dir)
     plot_suite(selected, species_metrics, class_metrics, args.out_dir, formats, regular, italic, bold, preliminary, args.max_labels)
     if type_metrics is not None:
-        type_metric_plot(type_metrics, args.out_dir, formats, regular, italic, bold, preliminary, args.max_labels)
+        type_metrics_for_plot = type_metrics
+        if aggregate is not None and not aggregate.empty:
+            total_row = filter_config(aggregate, config).iloc[[0]].copy()
+            total_row["type_name"] = "Total"
+            type_metrics_for_plot = pd.concat([type_metrics, total_row], ignore_index=True, sort=False)
+        type_metric_plot(type_metrics_for_plot, args.out_dir, formats, regular, italic, bold, preliminary, args.max_labels)
 
     aggregated_selected = aggregate_selected(selected)
     aggregated_species_metrics = aggregate_metric_rows(species_metrics, "species", aggregate_species_name)
     aggregated_class_metrics = aggregate_metric_rows(class_metrics, "class_name", aggregate_class_name)
+    write_metric_csv(args.out_dir.parent / "species_metrics_aggregated.csv", aggregated_species_metrics)
+    write_metric_csv(args.out_dir.parent / "class_metrics_aggregated.csv", aggregated_class_metrics)
     plot_suite(
         aggregated_selected,
         aggregated_species_metrics,

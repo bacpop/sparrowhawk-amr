@@ -294,19 +294,47 @@ def empty_universes() -> dict[str, set[str]]:
     return {metric: set() for metric in METRICS}
 
 
+CLASS_LIKE_FIELDS = {"Class", "Subclass", "class_name", "subclass"}
+
+
+def is_missing_label(value: object) -> bool:
+    text = str(value or "").strip()
+    return not text or text.upper() in {"NA", "UNCLASSIFIED"}
+
+
 def label_value(value: object) -> str:
     text = str(value or "").strip()
-    return text if text else "Unclassified"
+    if is_missing_label(text):
+        raise ValueError(f"Unresolved label: {value!r}")
+    return text
+
+
+def class_like_label(row: dict[str, Any], column: str) -> str:
+    value = str(row.get(column, "") or "").strip()
+    type_name = str(row.get("Type", "") or row.get("type_name", "") or "").strip().upper()
+    subtype = str(row.get("Subtype", "") or row.get("subtype", "") or "").strip()
+
+    if column in CLASS_LIKE_FIELDS and is_missing_label(value) and type_name != "AMR" and not is_missing_label(subtype):
+        value = subtype
+
+    if is_missing_label(value):
+        raise ValueError(f"Unresolved {column} after subtype fallback: {row}")
+
+    return value
+
+
+def row_label(row: dict[str, Any], column: str) -> str:
+    if column in CLASS_LIKE_FIELDS:
+        return class_like_label(row, column)
+    return label_value(row.get(column, ""))
 
 
 def labels_from_amrfinder_rows(rows: list[dict[str, str]], column: str, include_blank: bool = False) -> set[str]:
-    labels = {label_value(row.get(column, "")) for row in rows}
-    return labels if include_blank else {label for label in labels if label != "Unclassified"}
+    return {row_label(row, column) for row in rows}
 
 
 def labels_from_detector_hits(payload: dict[str, Any], field: str, include_blank: bool = False) -> set[str]:
-    labels = {label_value(hit.get(field)) for hit in payload.get("hits", [])}
-    return labels if include_blank else {label for label in labels if label != "Unclassified"}
+    return {row_label(hit, field) for hit in payload.get("hits", [])}
 
 
 def normalize_detector_hits(
@@ -342,11 +370,11 @@ def normalize_detector_hits(
 
 
 def filter_native_rows(rows: list[dict[str, str]], column: str, label: str) -> list[dict[str, str]]:
-    return [row for row in rows if label_value(row.get(column, "")) == label]
+    return [row for row in rows if row_label(row, column) == label]
 
 
 def filter_detector_hits(payload: dict[str, Any], field: str, label: str) -> list[dict[str, Any]]:
-    return [hit for hit in payload.get("hits", []) if label_value(hit.get(field)) == label]
+    return [hit for hit in payload.get("hits", []) if row_label(hit, field) == label]
 
 
 def update_universe(universe: dict[str, set[str]], detector_norm: dict[str, list[str]], baseline_norm: dict[str, list[str]]) -> None:
@@ -440,9 +468,6 @@ def main() -> None:
         species_class_universes: dict[str, dict[str, set[str]]] = collections.defaultdict(empty_universes)
         type_universes: dict[str, dict[str, set[str]]] = collections.defaultdict(empty_universes)
         per_assembly = []
-        missing_native_class = 0
-        missing_detector_class = 0
-
         for row in read_csv(status_csv):
             assembly_id = row["assembly_id"]
             baseline_row = amrfinder_status.get(assembly_id)
@@ -452,8 +477,6 @@ def main() -> None:
             native_rows = reportable_rows(Path(baseline_row["tsv_path"]), included_types)
             detector_json_path = resolve_existing_path(row["detector_json"], status_csv.parent)
             detector_payload = filter_detector_hits_by_type(load_json(detector_json_path), included_types)
-            missing_native_class += sum(1 for native_row in native_rows if not str(native_row.get("Class", "")).strip())
-            missing_detector_class += sum(1 for hit in detector_payload.get("hits", []) if not str(hit.get("class_name", "") or "").strip())
             baseline_norm = normalize_amrfinder(native_rows, report_map, hierarchy)
             detector_norm = normalize_detector(detector_payload, hierarchy)
             row_counts = metric_counts(detector_norm, baseline_norm, universes)
@@ -541,10 +564,6 @@ def main() -> None:
             f"report_unit_{params['min_report_unit_threshold']}_assemblies.csv"
         )
         write_csv(args.out_dir / out_name, list(per_assembly[0].keys()) if per_assembly else [], per_assembly)
-        if missing_native_class:
-            print(f"Warning: {missing_native_class} AMRFinderPlus rows had blank Class values and were omitted from class-level metrics for {status_csv}.")
-        if missing_detector_class:
-            print(f"Warning: {missing_detector_class} detector hits had blank class_name values and were omitted from class-level metrics for {status_csv}.")
         aggregate_rows.append(metric_row(params, micro))
         species_rows.extend(grouped_rows(species_micro, params, ("species",)))
         class_rows.extend(grouped_rows(class_micro, params, ("class_name",)))
