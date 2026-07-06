@@ -65,6 +65,7 @@ uv --directory "$BENCHMARK_DIR" run amr-analyze-failures \
   --comparison-dir "$COMPARISON_OUT" \
   --report-map-root "$REPORT_MAP_ROOT" \
   --hierarchy "$HIERARCHY" \
+  --include-types "$INCLUDE_TYPES" \
   --out-dir "$FAILURE_OUT"
 
 echo "Creating plots..."

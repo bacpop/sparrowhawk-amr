@@ -10,23 +10,21 @@ from typing import Any
 
 try:
     from .compare_amrfinder_batch import (
-        amr_rows,
         gene_group_key,
         load_hierarchy,
         load_report_map_rows,
         report_map_lookup,
-        normalize_amrfinder,
+        reportable_rows,
         report_map_path,
     )
     from .common import read_csv, write_csv
 except ImportError:
     from compare_amrfinder_batch import (
-        amr_rows,
         gene_group_key,
         load_hierarchy,
         load_report_map_rows,
         report_map_lookup,
-        normalize_amrfinder,
+        reportable_rows,
         report_map_path,
     )
     from common import read_csv, write_csv
@@ -53,9 +51,17 @@ def report_unit_for_native(row: dict[str, str], report_map: dict[str, str], hier
         return f"hierarchy_node:{gene_group_key(node, hierarchy)}"
     return f"exact_gene:{symbol}"
 
-## From ours
 def report_unit_for_detector(hit: dict[str, Any]) -> str:
-    return f"{hit.get('unit_type')}:{hit.get('unit_id')}"
+    unit_id = hit.get("unit_id")
+    if not unit_id:
+        return ""
+    if hit.get("unit_type"):
+        return f"{hit['unit_type']}:{unit_id}"
+    if hit.get("call_type") == "gene":
+        return f"exact_gene:{unit_id}"
+    if hit.get("call_type") in {"gene_group", "family"}:
+        return f"hierarchy_node:{unit_id}"
+    return ""
 
 
 def parse_mode_file(path: Path) -> tuple[str, int]:
@@ -82,8 +88,10 @@ def main() -> None:
     parser.add_argument("--report-map-root", type=Path, required=True)
     parser.add_argument("--hierarchy", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
+    parser.add_argument("--include-types", default="AMR,STRESS,VIRULENCE")
     args = parser.parse_args()
 
+    included_types = {value.strip().upper() for value in args.include_types.split(",") if value.strip()}
     hierarchy = load_hierarchy(args.hierarchy)
     per_mode_rows = []
     missed_unit_rows = []
@@ -115,7 +123,7 @@ def main() -> None:
             missed_units.update(missed)
             detector_units.update(detector_only)
 
-            native_rows = amr_rows(Path(row["native_amrfinder_tsv"]))
+            native_rows = reportable_rows(Path(row["native_amrfinder_tsv"]), included_types)
             for native_row in native_rows:
                 unit = report_unit_for_native(native_row, report_map, hierarchy)
                 if unit in missed:
@@ -140,6 +148,8 @@ def main() -> None:
             detector_payload = load_json(Path(row["detector_json"]))
             for hit in detector_payload.get("hits", []):
                 unit = report_unit_for_detector(hit)
+                if not unit:
+                    continue
                 if unit in detector_only:
                     detector_only_rows.append(
                         {
