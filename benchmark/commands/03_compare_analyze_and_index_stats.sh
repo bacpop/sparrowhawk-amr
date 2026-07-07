@@ -79,14 +79,13 @@ uv --directory "$BENCHMARK_DIR" run amr-plot-results \
   --out-dir "$COMPARISON_OUT/plots"
 
 echo "Collecting index stats..."
-for index in "$DETECTOR_OUT"/indexes/*.amridx; do
-  [[ -e "$index" ]] || continue
-  name="$(basename "$index" .amridx)"
+while IFS= read -r index; do
+  name="$(realpath --relative-to "$DETECTOR_OUT/indexes" "$index" | tr '/.' '__')"
   "$DETECTOR_BIN" index stats \
     --index "$index" \
     > "$RUN/index_stats_${name}.txt"
   du -h "$index" > "$RUN/index_size_${name}.txt"
-done
+done < <(find "$DETECTOR_OUT/indexes" -type f -name '*.amridx' | sort)
 
 echo "Main outputs:"
 echo "  Aggregate metrics:      $COMPARISON_OUT/aggregate_metrics.csv"

@@ -128,13 +128,22 @@ def load_report_map_rows(path: Path | None) -> list[dict[str, str]]:
         return list(csv.DictReader(handle, delimiter="\t"))
 
 
+def canonical_report_node(raw: str) -> str:
+    value = raw.strip()
+    if value.startswith("exact_gene:"):
+        value = value.split(":", 1)[1].split("|", 1)[0]
+    elif value.startswith("hierarchy_node:"):
+        value = value.split(":", 1)[1]
+    return value
+
+
 def report_map_lookup(rows: list[dict[str, str]]) -> dict[str, str]:
     mapping: dict[str, str] = {}
     for row in rows:
         accession = row.get("protein_accession", "")
         symbol = row.get("element_symbol", "")
         node = row.get("hierarchy_node", "")
-        unit = row.get("report_unit_key", "")
+        unit = canonical_report_node(row.get("report_unit_key", ""))
         for key in (accession, symbol, node):
             if key and unit:
                 mapping.setdefault(key, unit)
@@ -178,7 +187,7 @@ def report_map_context(rows: list[dict[str, str]], hierarchy: dict[str, dict[str
 
 
 def report_unit_coverage(node: str, context: dict[str, Any] | None) -> set[str]:
-    node = node.strip()
+    node = canonical_report_node(node)
     if not node:
         return set()
     if context is None:
@@ -239,15 +248,15 @@ def normalize_amrfinder(
     for row in rows:
         node = row.get("Hierarchy node", "")
         if node:
-            report_units.add(node)
+            report_units.add(canonical_report_node(node))
             continue
         accession = row.get("Closest reference accession", "")
         symbol = row.get("Element symbol", "")
         unit = report_map.get(accession) or report_map.get(symbol)
         if unit:
-            report_units.add(unit)
+            report_units.add(canonical_report_node(unit))
         elif symbol:
-            report_units.add(symbol)
+            report_units.add(canonical_report_node(symbol))
     return {
         "exact": exact,
         "gene_group": sorted(gene_groups),
@@ -296,7 +305,7 @@ def normalize_detector(
             else:
                 node_for_hit = hit.get("hierarchy_node") or hit.get("gene_group") or hit.get("element_symbol") or hit.get("unit_id", "")
                 if node_for_hit:
-                    report_units.add(str(node_for_hit))
+                    report_units.add(canonical_report_node(str(node_for_hit)))
     return {
         "exact": sorted(exact),
         "gene_group": sorted(gene_groups),
@@ -424,7 +433,7 @@ def normalize_detector_hits(
             else:
                 node_for_hit = hit.get("hierarchy_node") or hit.get("gene_group") or hit.get("element_symbol") or hit.get("unit_id", "")
                 if node_for_hit:
-                    report_units.add(str(node_for_hit))
+                    report_units.add(canonical_report_node(str(node_for_hit)))
     return {
         "exact": sorted(exact),
         "gene_group": sorted(gene_groups),
@@ -641,6 +650,12 @@ def main() -> None:
         type_micro: dict[str, collections.Counter[str]] = collections.defaultdict(collections.Counter)
         for label, detector_norm, baseline_norm in type_items:
             add_counts(type_micro[label], metric_counts(detector_norm, baseline_norm, type_universes[label]))
+
+        if micro["exact_tp"] > 0 and micro["report_unit_truth"] > 0 and micro["report_unit_tp"] == 0:
+            raise RuntimeError(
+                "report-unit true positives are zero despite exact true positives; "
+                "this usually means baseline and detector report-unit labels are in different namespaces"
+            )
 
         out_name = (
             f"{params['mode']}_k_{params['k']}_"

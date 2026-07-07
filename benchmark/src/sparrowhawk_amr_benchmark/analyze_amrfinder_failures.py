@@ -10,20 +10,24 @@ from typing import Any
 
 try:
     from .compare_amrfinder_batch import (
-        gene_group_key,
+        canonical_report_node,
         load_hierarchy,
         load_report_map_rows,
+        report_map_context,
         report_map_lookup,
+        report_unit_coverage,
         reportable_rows,
         report_map_path,
     )
     from .common import read_csv, write_csv
 except ImportError:
     from compare_amrfinder_batch import (
-        gene_group_key,
+        canonical_report_node,
         load_hierarchy,
         load_report_map_rows,
+        report_map_context,
         report_map_lookup,
+        report_unit_coverage,
         reportable_rows,
         report_map_path,
     )
@@ -39,37 +43,36 @@ def load_json(path: Path) -> dict[str, Any]:
         return json.load(handle)
 
 
-## To get from AMRF+ results
-def report_unit_for_native(row: dict[str, str], report_map: dict[str, str], hierarchy: dict[str, dict[str, str]]) -> str:
+def report_unit_for_native(row: dict[str, str], report_map: dict[str, str]) -> str:
+    node = row.get("Hierarchy node", "")
+    if node:
+        return canonical_report_node(node)
     accession = row.get("Closest reference accession", "")
     symbol = row.get("Element symbol", "")
-    node = row.get("Hierarchy node", "")
-    unit = report_map.get(accession) or report_map.get(symbol) or report_map.get(node)
-    if unit:
-        return unit
-    if node:
-        return f"hierarchy_node:{gene_group_key(node, hierarchy)}"
-    return f"exact_gene:{symbol}"
+    unit = report_map.get(accession) or report_map.get(symbol)
+    return canonical_report_node(unit or symbol)
 
-def report_unit_for_detector(hit: dict[str, Any]) -> str:
+
+def report_units_for_detector(hit: dict[str, Any], report_context: dict[str, Any] | None) -> set[str]:
     unit_id = hit.get("unit_id")
     if not unit_id:
-        return ""
-    if hit.get("unit_type"):
-        return f"{hit['unit_type']}:{unit_id}"
-    if hit.get("call_type") == "gene":
-        return f"exact_gene:{unit_id}"
-    if hit.get("call_type") in {"gene_group", "family"}:
-        return f"hierarchy_node:{unit_id}"
-    return ""
+        return set()
+    unit_type = hit.get("unit_type") or ("exact_gene" if hit.get("call_type") == "gene" else "hierarchy_node")
+    if unit_type == "hierarchy_node":
+        return report_unit_coverage(str(unit_id), report_context)
+    node = hit.get("hierarchy_node") or hit.get("gene_group") or hit.get("element_symbol") or unit_id
+    return {canonical_report_node(str(node))} if node else set()
 
 
-def parse_mode_file(path: Path) -> tuple[str, int]:
-    # direct_k_31_fraction_gene_0.100_gene_group_0.100_assemblies.csv
+def parse_mode_file(path: Path) -> tuple[str, str, int]:
     parts = path.name.split("_")
+    strategy = "current"
+    with path.open(newline="") as handle:
+        first_row = next(csv.DictReader(handle), {})
+        strategy = first_row.get("report_unit_strategy", "current") or "current"
     if path.name.startswith("protein_cds_"):
-        return "protein_cds", int(parts[3])
-    return parts[0], int(parts[2])
+        return strategy, "protein_cds", int(parts[3])
+    return strategy, parts[0], int(parts[2])
 
 
 def pct(values: list[float], threshold: float) -> float:
@@ -98,8 +101,10 @@ def main() -> None:
     detector_only_rows = []
 
     for assembly_csv in sorted(args.comparison_dir.glob("*_assemblies.csv")):
-        mode, k = parse_mode_file(assembly_csv)
-        report_map = report_map_lookup(load_report_map_rows(report_map_path(args.report_map_root, mode, k)))
+        strategy, mode, k = parse_mode_file(assembly_csv)
+        report_map_rows = load_report_map_rows(report_map_path(args.report_map_root, mode, k, strategy))
+        report_map = report_map_lookup(report_map_rows)
+        report_context = report_map_context(report_map_rows, hierarchy, included_types)
         rows = read_csv(assembly_csv)
         native_method_counts: collections.Counter[str] = collections.Counter()
         missed_units: collections.Counter[str] = collections.Counter()
@@ -125,11 +130,12 @@ def main() -> None:
 
             native_rows = reportable_rows(Path(row["native_amrfinder_tsv"]), included_types)
             for native_row in native_rows:
-                unit = report_unit_for_native(native_row, report_map, hierarchy)
+                unit = report_unit_for_native(native_row, report_map)
                 if unit in missed:
                     native_method_counts[native_row.get("Method", "")] += 1
                     missed_unit_rows.append(
                         {
+                            "report_unit_strategy": strategy,
                             "mode": mode,
                             "k": k,
                             "assembly_id": row["assembly_id"],
@@ -147,12 +153,12 @@ def main() -> None:
 
             detector_payload = load_json(Path(row["detector_json"]))
             for hit in detector_payload.get("hits", []):
-                unit = report_unit_for_detector(hit)
-                if not unit:
-                    continue
-                if unit in detector_only:
+                for unit in report_units_for_detector(hit, report_context):
+                    if unit not in detector_only:
+                        continue
                     detector_only_rows.append(
                         {
+                            "report_unit_strategy": strategy,
                             "mode": mode,
                             "k": k,
                             "assembly_id": row["assembly_id"],
@@ -175,6 +181,7 @@ def main() -> None:
 
         per_mode_rows.append(
             {
+                "report_unit_strategy": strategy,
                 "mode": mode,
                 "k": k,
                 "assemblies": len(rows),
