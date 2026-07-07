@@ -70,6 +70,11 @@ CLASS_ALIASES = {
     "FUSICDIC_ACID": "FUSIDIC_ACID",
     "FUSIDIC ACID": "FUSIDIC_ACID",
 }
+BIOCIDE_LABELS = {
+    "BIOCIDE",
+    "BIOCIDES",
+    "QUATERNARY AMMONIUM",
+}
 METAL_LABELS = {
     "METAL",
     "METALS",
@@ -197,6 +202,15 @@ def reject_unresolved_labels(dataframe: pd.DataFrame, column: str, path: Path) -
         )
 
 
+def require_columns(dataframe: pd.DataFrame, path: Path, columns: set[str]) -> None:
+    missing = columns - set(dataframe.columns)
+    if missing:
+        raise SystemExit(
+            f"{path} is missing required columns {sorted(missing)}; "
+            "rerun amr-compare-amrfinder-batch with the updated benchmark code"
+        )
+
+
 def safe_float(value: object) -> float:
     try:
         return float(value)
@@ -249,8 +263,15 @@ def aggregate_species_name(value: object) -> str:
 
 def aggregate_class_name(value: object) -> str:
     class_name = normalise_class_name(value)
-    if class_name.upper() in METAL_LABELS:
+    class_upper = class_name.upper()
+    if class_upper in METAL_LABELS:
         return "Stress/Metal"
+    if class_upper in BIOCIDE_LABELS:
+        return "Stress/Biocide"
+    if class_upper == "ACID":
+        return "Stress/Acid"
+    if class_upper == "HEAT":
+        return "Stress/Heat"
     return class_name
 
 
@@ -265,15 +286,21 @@ def aggregate_concern_group(row: pd.Series) -> str:
     if type_name == "STRESS":
         if subtype == "METAL" or class_upper in METAL_LABELS:
             return "Stress/Metal"
-        if subtype == "BIOCIDE":
+        if subtype == "BIOCIDE" or class_upper in BIOCIDE_LABELS:
             return "Stress/Biocide"
-        if subtype == "ACID":
+        if subtype == "ACID" or class_upper == "ACID":
             return "Stress/Acid"
-        if subtype == "HEAT":
+        if subtype == "HEAT" or class_upper == "HEAT":
             return "Stress/Heat"
         raise ValueError(f"Unexpected STRESS subtype for aggregation: {subtype!r}")
     if class_upper in METAL_LABELS:
         return "Stress/Metal"
+    if class_upper in BIOCIDE_LABELS:
+        return "Stress/Biocide"
+    if class_upper == "ACID":
+        return "Stress/Acid"
+    if class_upper == "HEAT":
+        return "Stress/Heat"
     return aggregate_class_name(class_name)
 
 
@@ -319,13 +346,14 @@ def recompute_metric_fields(dataframe: pd.DataFrame) -> pd.DataFrame:
     return out.fillna(0)
 
 
-def merge_metric_rows(dataframe: pd.DataFrame, label_column: str) -> pd.DataFrame:
-    if dataframe.empty or label_column not in dataframe.columns:
+def merge_metric_rows(dataframe: pd.DataFrame, label_columns: str | list[str]) -> pd.DataFrame:
+    labels = [label_columns] if isinstance(label_columns, str) else list(label_columns)
+    if dataframe.empty or any(label not in dataframe.columns for label in labels):
         return dataframe
     count_columns = metric_count_columns(dataframe)
     if not count_columns:
         return dataframe
-    group_columns = [column for column in CONFIG_COLUMNS if column in dataframe.columns] + [label_column]
+    group_columns = [column for column in CONFIG_COLUMNS if column in dataframe.columns] + labels
     sum_columns = count_columns + (["assemblies_compared"] if "assemblies_compared" in dataframe.columns else [])
     grouped = dataframe.groupby(group_columns, dropna=False)[sum_columns].sum().reset_index()
     return recompute_metric_fields(grouped)
@@ -345,6 +373,33 @@ def aggregate_metric_rows_by_row(dataframe: pd.DataFrame, label_column: str, map
     out = dataframe.copy()
     out[label_column] = out.apply(mapper, axis=1)
     return merge_metric_rows(out, label_column)
+
+
+def aggregate_species_class_metric_rows(dataframe: pd.DataFrame) -> pd.DataFrame:
+    if dataframe.empty:
+        return dataframe
+    out = dataframe.copy()
+    out["species"] = out["species"].map(aggregate_species_name)
+    out["class_name"] = out.apply(aggregate_concern_group, axis=1)
+    return merge_metric_rows(out, ["species", "class_name"])
+
+
+def metric_label_counts(dataframe: pd.DataFrame, label_column: str) -> pd.Series:
+    if dataframe.empty or label_column not in dataframe.columns or "assemblies_compared" not in dataframe.columns:
+        return pd.Series(dtype=float)
+    return dataframe.groupby(label_column, dropna=False)["assemblies_compared"].sum().sort_values(ascending=False)
+
+
+def species_class_table_from_metrics(dataframe: pd.DataFrame) -> pd.DataFrame:
+    if dataframe.empty or not {"species", "class_name", "assemblies_compared"} <= set(dataframe.columns):
+        return pd.DataFrame()
+    return dataframe.pivot_table(
+        index="species",
+        columns="class_name",
+        values="assemblies_compared",
+        aggfunc="sum",
+        fill_value=0,
+    )
 
 
 def aggregate_selected(dataframe: pd.DataFrame) -> pd.DataFrame:
@@ -620,9 +675,24 @@ def stacked_plot(table: pd.DataFrame, title: str, contribution_label: str, basen
     save_figure(fig, out_dir, basename, formats)
 
 
-def plot_suite(selected: pd.DataFrame, species_metrics: pd.DataFrame, class_metrics: pd.DataFrame, out_dir: Path, formats: list[str], regular: FontProperties | None, italic: FontProperties | None, bold: FontProperties | None, preliminary: bool, max_labels: int, suffix: str = "") -> None:
+def plot_suite(
+    selected: pd.DataFrame,
+    species_metrics: pd.DataFrame,
+    class_metrics: pd.DataFrame,
+    out_dir: Path,
+    formats: list[str],
+    regular: FontProperties | None,
+    italic: FontProperties | None,
+    bold: FontProperties | None,
+    preliminary: bool,
+    max_labels: int,
+    suffix: str = "",
+    class_count_values: pd.Series | None = None,
+    species_class_count_table: pd.DataFrame | None = None,
+) -> None:
     species_count_values = species_counts(selected)
-    class_count_values = class_counts(selected)
+    if class_count_values is None:
+        class_count_values = class_counts(selected)
     species_order = ordered_labels_from_counts(species_count_values, max_labels)
     class_order = ordered_labels_from_counts(class_count_values, max_labels)
     species_order = append_metric_only_labels(species_order, species_metrics, "species", max_labels)
@@ -633,7 +703,7 @@ def plot_suite(selected: pd.DataFrame, species_metrics: pd.DataFrame, class_metr
     metric_plot(class_table.iloc[::-1], "class_name", "Antibiotic class", f"report_unit_class_metrics{suffix}", out_dir, formats, regular, italic, bold, preliminary, class_count_values)
     count_plot(apply_order_to_counts(species_count_values, species_order), "Species", f"species_assembly_counts{suffix}", out_dir, formats, regular, italic, bold, preliminary, italic_labels=True)
     count_plot(apply_order_to_counts(class_count_values, class_order), "Antibiotic class", f"class_assembly_counts{suffix}", out_dir, formats, regular, italic, bold, preliminary)
-    table = species_class_table(selected)
+    table = species_class_count_table if species_class_count_table is not None else species_class_table(selected)
     stacked_plot(apply_order_to_table(table, species_order, class_order), "Species", "antibiotic class", f"species_counts_by_class_stacked{suffix}", out_dir, formats, regular, italic, bold, preliminary, italic_labels=True)
     stacked_plot(apply_order_to_table(table.T, class_order, species_order), "Antibiotic class", "species", f"class_counts_by_species_stacked{suffix}", out_dir, formats, regular, italic, bold, preliminary, italic_contributions=True)
 
@@ -686,6 +756,7 @@ def main() -> None:
     selected = normalise_selected(read_plot_csv(args.selected_manifest))
     species_metrics = merge_metric_rows(normalise_metric_labels(filter_config(read_plot_csv(args.species_metrics), config)), "species")
     class_raw = read_plot_csv(args.class_metrics)
+    require_columns(class_raw, args.class_metrics, {"type_name", "subtype", "class_name"})
     reject_unresolved_labels(class_raw, "class_name", args.class_metrics)
     class_filtered = normalise_metric_labels(filter_config(class_raw, config))
     class_metrics_for_aggregation = class_filtered
@@ -693,6 +764,7 @@ def main() -> None:
     species_class_metrics = None
     if args.species_class_metrics and args.species_class_metrics.exists():
         species_class_raw = read_plot_csv(args.species_class_metrics)
+        require_columns(species_class_raw, args.species_class_metrics, {"species", "type_name", "subtype", "class_name"})
         reject_unresolved_labels(species_class_raw, "class_name", args.species_class_metrics)
         species_class_metrics = normalise_metric_labels(filter_config(species_class_raw, config))
     type_metrics = None
@@ -718,8 +790,20 @@ def main() -> None:
         "class_name",
         aggregate_concern_group,
     )
+    aggregated_species_class_metrics = None
+    if species_class_metrics is not None:
+        aggregated_species_class_metrics = aggregate_species_class_metric_rows(species_class_metrics)
+        write_metric_csv(args.out_dir.parent / "species_class_metrics_aggregated.csv", aggregated_species_class_metrics)
+
     write_metric_csv(args.out_dir.parent / "species_metrics_aggregated.csv", aggregated_species_metrics)
     write_metric_csv(args.out_dir.parent / "class_metrics_aggregated.csv", aggregated_class_metrics)
+
+    aggregated_class_counts = metric_label_counts(aggregated_class_metrics, "class_name")
+    aggregated_species_class_table = (
+        species_class_table_from_metrics(aggregated_species_class_metrics)
+        if aggregated_species_class_metrics is not None
+        else None
+    )
     plot_suite(
         aggregated_selected,
         aggregated_species_metrics,
@@ -732,6 +816,8 @@ def main() -> None:
         preliminary,
         args.max_labels,
         "_aggregated",
+        class_count_values=aggregated_class_counts,
+        species_class_count_table=aggregated_species_class_table,
     )
 
 

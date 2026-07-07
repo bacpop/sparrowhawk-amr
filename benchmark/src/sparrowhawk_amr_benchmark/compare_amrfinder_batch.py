@@ -491,15 +491,33 @@ def main() -> None:
                 type_items.append((type_label, type_detector, type_baseline))
                 update_universe(type_universes[type_label], type_detector, type_baseline)
 
-            for class_label in labels_from_amrfinder_rows(native_rows, "Class") | labels_from_detector_hits(detector_payload, "class_name"):
-                class_baseline = normalize_amrfinder(filter_native_rows(native_rows, "Class", class_label), report_map, hierarchy)
-                class_detector = normalize_detector_hits(filter_detector_hits(detector_payload, "class_name", class_label), hierarchy)
-                class_items.append((class_label, class_detector, class_baseline))
-                update_universe(class_universes[class_label], class_detector, class_baseline)
+            for type_label in labels_from_amrfinder_rows(native_rows, "Type") | labels_from_detector_hits(detector_payload, "type_name"):
+                type_native_rows = filter_native_rows(native_rows, "Type", type_label)
+                type_detector_hits = filter_detector_hits(detector_payload, "type_name", type_label)
+                type_payload = {"hits": type_detector_hits}
 
-                species_class_label = f"{species}||{class_label}"
-                species_class_items.append((species_class_label, class_detector, class_baseline))
-                update_universe(species_class_universes[species_class_label], class_detector, class_baseline)
+                for subtype_label in labels_from_amrfinder_rows(type_native_rows, "Subtype") | labels_from_detector_hits(type_payload, "subtype"):
+                    subtype_native_rows = filter_native_rows(type_native_rows, "Subtype", subtype_label)
+                    subtype_detector_hits = filter_detector_hits(type_payload, "subtype", subtype_label)
+                    subtype_payload = {"hits": subtype_detector_hits}
+
+                    class_labels = labels_from_amrfinder_rows(subtype_native_rows, "Class") | labels_from_detector_hits(
+                        subtype_payload,
+                        "class_name",
+                    )
+                    for class_label in class_labels:
+                        class_native_rows = filter_native_rows(subtype_native_rows, "Class", class_label)
+                        class_hits = filter_detector_hits(subtype_payload, "class_name", class_label)
+                        class_baseline = normalize_amrfinder(class_native_rows, report_map, hierarchy)
+                        class_detector = normalize_detector_hits(class_hits, hierarchy)
+
+                        class_key = f"{type_label}||{subtype_label}||{class_label}"
+                        class_items.append((class_key, class_detector, class_baseline))
+                        update_universe(class_universes[class_key], class_detector, class_baseline)
+
+                        species_class_key = f"{species}||{type_label}||{subtype_label}||{class_label}"
+                        species_class_items.append((species_class_key, class_detector, class_baseline))
+                        update_universe(species_class_universes[species_class_key], class_detector, class_baseline)
 
             for subclass_label in labels_from_amrfinder_rows(native_rows, "Subclass") | labels_from_detector_hits(detector_payload, "subclass"):
                 subclass_baseline = normalize_amrfinder(filter_native_rows(native_rows, "Subclass", subclass_label), report_map, hierarchy)
@@ -566,9 +584,9 @@ def main() -> None:
         write_csv(args.out_dir / out_name, list(per_assembly[0].keys()) if per_assembly else [], per_assembly)
         aggregate_rows.append(metric_row(params, micro))
         species_rows.extend(grouped_rows(species_micro, params, ("species",)))
-        class_rows.extend(grouped_rows(class_micro, params, ("class_name",)))
+        class_rows.extend(grouped_rows(class_micro, params, ("type_name", "subtype", "class_name")))
         subclass_rows.extend(grouped_rows(subclass_micro, params, ("subclass",)))
-        species_class_rows.extend(grouped_rows(species_class_micro, params, ("species", "class_name")))
+        species_class_rows.extend(grouped_rows(species_class_micro, params, ("species", "type_name", "subtype", "class_name")))
         type_rows.extend(grouped_rows(type_micro, params, ("type_name",)))
 
     write_csv(args.out_dir / "aggregate_metrics.csv", list(aggregate_rows[0].keys()) if aggregate_rows else [], aggregate_rows)
