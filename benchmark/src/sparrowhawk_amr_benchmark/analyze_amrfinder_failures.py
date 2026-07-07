@@ -15,7 +15,9 @@ try:
         load_report_map_rows,
         report_map_context,
         report_map_lookup,
-        report_unit_coverage,
+        detector_report_units_for_matching,
+        filter_detector_hits_by_type,
+        report_unit_differences,
         reportable_rows,
         report_map_path,
     )
@@ -27,15 +29,13 @@ except ImportError:
         load_report_map_rows,
         report_map_context,
         report_map_lookup,
-        report_unit_coverage,
+        detector_report_units_for_matching,
+        filter_detector_hits_by_type,
+        report_unit_differences,
         reportable_rows,
         report_map_path,
     )
     from common import read_csv, write_csv
-
-
-def split_set(raw: str) -> set[str]:
-    return {part for part in raw.split(";") if part}
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -53,15 +53,8 @@ def report_unit_for_native(row: dict[str, str], report_map: dict[str, str]) -> s
     return canonical_report_node(unit or symbol)
 
 
-def report_units_for_detector(hit: dict[str, Any], report_context: dict[str, Any] | None) -> set[str]:
-    unit_id = hit.get("unit_id")
-    if not unit_id:
-        return set()
-    unit_type = hit.get("unit_type") or ("exact_gene" if hit.get("call_type") == "gene" else "hierarchy_node")
-    if unit_type == "hierarchy_node":
-        return report_unit_coverage(str(unit_id), report_context)
-    node = hit.get("hierarchy_node") or hit.get("gene_group") or hit.get("element_symbol") or unit_id
-    return {canonical_report_node(str(node))} if node else set()
+def report_units_for_detector(hit: dict[str, Any]) -> set[str]:
+    return detector_report_units_for_matching(hit)
 
 
 def parse_mode_file(path: Path) -> tuple[str, str, int]:
@@ -123,12 +116,21 @@ def main() -> None:
             total_report_unit_fp += int(row["report_unit_fp"])
             exact_resolved_by_report_unit += max(0, int(row["exact_fn"]) - int(row["report_unit_fn"]))
 
-            missed = split_set(row["baseline_only_report_unit"])
-            detector_only = split_set(row["detector_only_report_unit"])
+            native_rows = reportable_rows(Path(row["native_amrfinder_tsv"]), included_types)
+            detector_payload = filter_detector_hits_by_type(load_json(Path(row["detector_json"])), included_types)
+            truth_units = {report_unit_for_native(native_row, report_map) for native_row in native_rows}
+            detector_report_units = {
+                unit
+                for hit in detector_payload.get("hits", [])
+                for unit in report_units_for_detector(hit)
+            }
+            missed, detector_only = report_unit_differences(
+                detector_report_units,
+                truth_units,
+                report_context,
+            )
             missed_units.update(missed)
             detector_units.update(detector_only)
-
-            native_rows = reportable_rows(Path(row["native_amrfinder_tsv"]), included_types)
             for native_row in native_rows:
                 unit = report_unit_for_native(native_row, report_map)
                 if unit in missed:
@@ -151,9 +153,8 @@ def main() -> None:
                         }
                     )
 
-            detector_payload = load_json(Path(row["detector_json"]))
             for hit in detector_payload.get("hits", []):
-                for unit in report_units_for_detector(hit, report_context):
+                for unit in report_units_for_detector(hit):
                     if unit not in detector_only:
                         continue
                     detector_only_rows.append(

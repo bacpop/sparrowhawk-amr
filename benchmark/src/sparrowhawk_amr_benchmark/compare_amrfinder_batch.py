@@ -196,6 +196,40 @@ def report_unit_coverage(node: str, context: dict[str, Any] | None) -> set[str]:
     return covered or {node}
 
 
+def detector_report_units_for_matching(hit: dict[str, Any]) -> set[str]:
+    unit_id = hit.get("unit_id")
+    if not unit_id:
+        return set()
+
+    unit_type = hit.get("unit_type") or (
+        "exact_gene" if hit.get("call_type") == "gene" else "hierarchy_node"
+    )
+
+    if unit_type == "hierarchy_node":
+        return {canonical_report_node(str(unit_id))}
+
+    node = (
+        hit.get("hierarchy_node")
+        or hit.get("gene_group")
+        or hit.get("element_symbol")
+        or unit_id
+    )
+    return {canonical_report_node(str(node))} if node else set()
+
+
+def report_unit_covers(detector_node: str, truth_node: str, context: dict[str, Any] | None) -> bool:
+    detector_node = canonical_report_node(detector_node)
+    truth_node = canonical_report_node(truth_node)
+
+    if detector_node == truth_node:
+        return True
+
+    if context is None:
+        return False
+
+    return truth_node in report_unit_coverage(detector_node, context)
+
+
 def metric_universes(
     report_map_rows: list[dict[str, str]],
     hierarchy: dict[str, dict[str, str]],
@@ -298,14 +332,7 @@ def normalize_detector(
         if key:
             gene_groups.add(key)
 
-        if hit.get("unit_id"):
-            unit_type = hit.get("unit_type") or ("exact_gene" if hit.get("call_type") == "gene" else "hierarchy_node")
-            if unit_type == "hierarchy_node":
-                report_units.update(report_unit_coverage(str(hit.get("unit_id", "")), report_context))
-            else:
-                node_for_hit = hit.get("hierarchy_node") or hit.get("gene_group") or hit.get("element_symbol") or hit.get("unit_id", "")
-                if node_for_hit:
-                    report_units.add(canonical_report_node(str(node_for_hit)))
+        report_units.update(detector_report_units_for_matching(hit))
     return {
         "exact": sorted(exact),
         "gene_group": sorted(gene_groups),
@@ -319,6 +346,48 @@ def counts(detector: set[str], baseline: set[str], universe: set[str]) -> dict[s
     fn = len(baseline - detector)
     tn = len(universe - (detector | baseline))
     return {"tp": tp, "fp": fp, "fn": fn, "tn": tn, "pred": len(detector), "truth": len(baseline)}
+
+
+def report_unit_differences(
+    detector_nodes: set[str],
+    truth_nodes: set[str],
+    context: dict[str, Any] | None,
+) -> tuple[set[str], set[str]]:
+    missed = {
+        truth
+        for truth in truth_nodes
+        if not any(report_unit_covers(detector, truth, context) for detector in detector_nodes)
+    }
+
+    detector_only = {
+        detector
+        for detector in detector_nodes
+        if not any(report_unit_covers(detector, truth, context) for truth in truth_nodes)
+    }
+
+    return missed, detector_only
+
+
+def report_unit_counts(
+    detector_nodes: set[str],
+    truth_nodes: set[str],
+    universe: set[str],
+    context: dict[str, Any] | None,
+) -> dict[str, int]:
+    missed, detector_only = report_unit_differences(detector_nodes, truth_nodes, context)
+    tp = len(truth_nodes - missed)
+    fn = len(missed)
+    fp = len(detector_only)
+    tn = len(universe - truth_nodes - detector_nodes)
+
+    return {
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
+        "tn": tn,
+        "pred": tp + fp,
+        "truth": len(truth_nodes),
+    }
 
 
 def add_metric_fields(prefix: str, values: collections.Counter[str]) -> dict[str, object]:
@@ -426,14 +495,7 @@ def normalize_detector_hits(
         if key:
             gene_groups.add(key)
 
-        if hit.get("unit_id"):
-            unit_type = hit.get("unit_type") or ("exact_gene" if hit.get("call_type") == "gene" else "hierarchy_node")
-            if unit_type == "hierarchy_node":
-                report_units.update(report_unit_coverage(str(hit.get("unit_id", "")), report_context))
-            else:
-                node_for_hit = hit.get("hierarchy_node") or hit.get("gene_group") or hit.get("element_symbol") or hit.get("unit_id", "")
-                if node_for_hit:
-                    report_units.add(canonical_report_node(str(node_for_hit)))
+        report_units.update(detector_report_units_for_matching(hit))
     return {
         "exact": sorted(exact),
         "gene_group": sorted(gene_groups),
@@ -455,14 +517,24 @@ def update_universe(universe: dict[str, set[str]], detector_norm: dict[str, list
         universe[metric].update(baseline_norm[metric])
 
 
-def metric_counts(detector_norm: dict[str, list[str]], baseline_norm: dict[str, list[str]], universes: dict[str, set[str]]) -> dict[str, dict[str, int]]:
+def metric_counts(
+    detector_norm: dict[str, list[str]],
+    baseline_norm: dict[str, list[str]],
+    universes: dict[str, set[str]],
+    report_context: dict[str, Any] | None = None,
+) -> dict[str, dict[str, int]]:
     return {
-        metric: counts(
-            set(detector_norm[metric]),
-            set(baseline_norm[metric]),
-            universes[metric],
-        )
-        for metric in METRICS
+        "exact": counts(
+            set(detector_norm["exact"]),
+            set(baseline_norm["exact"]),
+            universes["exact"],
+        ),
+        "report_unit": report_unit_counts(
+            set(detector_norm["report_unit"]),
+            set(baseline_norm["report_unit"]),
+            universes["report_unit"],
+            report_context,
+        ),
     }
 
 
@@ -554,7 +626,7 @@ def main() -> None:
             detector_payload = filter_detector_hits_by_type(load_json(detector_json_path), included_types)
             baseline_norm = normalize_amrfinder(native_rows, report_map, hierarchy, report_context)
             detector_norm = normalize_detector(detector_payload, hierarchy, report_context)
-            row_counts = metric_counts(detector_norm, baseline_norm, universes)
+            row_counts = metric_counts(detector_norm, baseline_norm, universes, report_context)
             add_counts(micro, row_counts)
 
             species = row.get("species", "") or "Unknown species"
@@ -604,6 +676,11 @@ def main() -> None:
             exact_baseline = set(baseline_norm["exact"])
             report_detector = set(detector_norm["report_unit"])
             report_baseline = set(baseline_norm["report_unit"])
+            missed_report_units, detector_only_report_units = report_unit_differences(
+                report_detector,
+                report_baseline,
+                report_context,
+            )
             per_assembly.append(
                 {
                     "assembly_id": assembly_id,
@@ -630,26 +707,26 @@ def main() -> None:
                     "report_unit_specificity": safe_ratio(row_counts["report_unit"]["tn"], row_counts["report_unit"]["tn"] + row_counts["report_unit"]["fp"]),
                     "baseline_only_exact": ";".join(sorted(exact_baseline - exact_detector)),
                     "detector_only_exact": ";".join(sorted(exact_detector - exact_baseline)),
-                    "baseline_only_report_unit": ";".join(sorted(report_baseline - report_detector)),
-                    "detector_only_report_unit": ";".join(sorted(report_detector - report_baseline)),
+                    "baseline_only_report_unit": ";".join(sorted(missed_report_units)),
+                    "detector_only_report_unit": ";".join(sorted(detector_only_report_units)),
                 }
             )
 
         class_micro: dict[str, collections.Counter[str]] = collections.defaultdict(collections.Counter)
         for label, detector_norm, baseline_norm in class_items:
-            add_counts(class_micro[label], metric_counts(detector_norm, baseline_norm, class_universes[label]))
+            add_counts(class_micro[label], metric_counts(detector_norm, baseline_norm, class_universes[label], report_context))
 
         subclass_micro: dict[str, collections.Counter[str]] = collections.defaultdict(collections.Counter)
         for label, detector_norm, baseline_norm in subclass_items:
-            add_counts(subclass_micro[label], metric_counts(detector_norm, baseline_norm, subclass_universes[label]))
+            add_counts(subclass_micro[label], metric_counts(detector_norm, baseline_norm, subclass_universes[label], report_context))
 
         species_class_micro: dict[str, collections.Counter[str]] = collections.defaultdict(collections.Counter)
         for label, detector_norm, baseline_norm in species_class_items:
-            add_counts(species_class_micro[label], metric_counts(detector_norm, baseline_norm, species_class_universes[label]))
+            add_counts(species_class_micro[label], metric_counts(detector_norm, baseline_norm, species_class_universes[label], report_context))
 
         type_micro: dict[str, collections.Counter[str]] = collections.defaultdict(collections.Counter)
         for label, detector_norm, baseline_norm in type_items:
-            add_counts(type_micro[label], metric_counts(detector_norm, baseline_norm, type_universes[label]))
+            add_counts(type_micro[label], metric_counts(detector_norm, baseline_norm, type_universes[label], report_context))
 
         if micro["exact_tp"] > 0 and micro["report_unit_truth"] > 0 and micro["report_unit_tp"] == 0:
             raise RuntimeError(
