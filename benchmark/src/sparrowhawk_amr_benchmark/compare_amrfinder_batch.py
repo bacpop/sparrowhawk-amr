@@ -32,9 +32,15 @@ def parse_status_name(path: Path, detector_root: Path) -> dict[str, object]:
             f"Detector status CSV must be under --detector-root {detector_root}; got {path}. "
             "Pass the detector *_status.csv files, not the comparison output status.csv."
         ) from exc
+    known_strategies = {"current", "parent_only", "exact_and_parent", "exact_and_weak_parent"}
+    report_unit_strategy = "current"
     mode = "direct"
     k_part = path.parent.name
-    if len(relative_parts) >= 3 and not relative_parts[0].startswith("k_"):
+    if len(relative_parts) >= 4 and relative_parts[0] in known_strategies:
+        report_unit_strategy = relative_parts[0]
+        mode = relative_parts[1]
+        k_part = relative_parts[2]
+    elif len(relative_parts) >= 3 and not relative_parts[0].startswith("k_"):
         mode = relative_parts[0]
         k_part = relative_parts[1]
     k_match = re.fullmatch(r"k_(\d+)", k_part)
@@ -44,6 +50,7 @@ def parse_status_name(path: Path, detector_root: Path) -> dict[str, object]:
     old_match = OLD_STATUS_RE.fullmatch(stem)
     if old_match:
         return {
+            "report_unit_strategy": report_unit_strategy,
             "mode": mode,
             "k": int(k_match.group(1)),
             "threshold_mode": "absolute",
@@ -57,6 +64,7 @@ def parse_status_name(path: Path, detector_root: Path) -> dict[str, object]:
         min_gene_fraction = parse_fraction_label(new_match.group(1))
         min_report_unit_fraction = parse_fraction_label(new_match.group(2))
         return {
+            "report_unit_strategy": report_unit_strategy,
             "mode": mode,
             "k": int(k_match.group(1)),
             "threshold_mode": "fraction",
@@ -133,6 +141,52 @@ def report_map_lookup(rows: list[dict[str, str]]) -> dict[str, str]:
     return mapping
 
 
+def hierarchy_children(hierarchy: dict[str, dict[str, str]]) -> dict[str, set[str]]:
+    children: dict[str, set[str]] = collections.defaultdict(set)
+    for node, meta in hierarchy.items():
+        parent = meta.get("parent_node_id", "")
+        if parent:
+            children[parent].add(node)
+    return children
+
+
+def report_map_context(rows: list[dict[str, str]], hierarchy: dict[str, dict[str, str]], included_types: set[str]) -> dict[str, Any]:
+    report_nodes = {
+        row.get("hierarchy_node", "")
+        for row in rows
+        if row.get("type", "").strip().upper() in included_types and row.get("hierarchy_node", "")
+    }
+    children = hierarchy_children(hierarchy)
+    descendant_cache: dict[str, set[str]] = {}
+
+    def descendants(node: str) -> set[str]:
+        if node in descendant_cache:
+            return descendant_cache[node]
+        covered = {node} if node in report_nodes else set()
+        stack = list(children.get(node, set()))
+        while stack:
+            child = stack.pop()
+            if child in report_nodes:
+                covered.add(child)
+            stack.extend(children.get(child, set()))
+        descendant_cache[node] = covered
+        return covered
+
+    for node in list(report_nodes):
+        descendants(node)
+    return {"report_nodes": report_nodes, "descendants": descendant_cache, "descendant_fn": descendants}
+
+
+def report_unit_coverage(node: str, context: dict[str, Any] | None) -> set[str]:
+    node = node.strip()
+    if not node:
+        return set()
+    if context is None:
+        return {node}
+    covered = context["descendant_fn"](node)
+    return covered or {node}
+
+
 def metric_universes(
     report_map_rows: list[dict[str, str]],
     hierarchy: dict[str, dict[str, str]],
@@ -149,9 +203,9 @@ def metric_universes(
         if row.get("element_symbol", "")
     }
     report_unit = {
-        row.get("report_unit_key", "")
+        row.get("hierarchy_node", "")
         for row in report_map_rows
-        if row.get("report_unit_key", "")
+        if row.get("hierarchy_node", "")
     }
     return {
         "exact": {value for value in exact if value},
@@ -159,8 +213,11 @@ def metric_universes(
     }
 
 
-def report_map_path(report_map_root: Path, mode: str, k: int) -> Path:
+def report_map_path(report_map_root: Path, mode: str, k: int, strategy: str = "current") -> Path:
     alphabet = "protein" if mode == "protein_cds" else "dna"
+    strategy_path = report_map_root / strategy / f"{alphabet}_k{k}.tsv"
+    if strategy_path.exists():
+        return strategy_path
     return report_map_root / f"{alphabet}_k{k}.tsv"
 
 
@@ -168,6 +225,7 @@ def normalize_amrfinder(
     rows: list[dict[str, str]],
     report_map: dict[str, str],
     hierarchy: dict[str, dict[str, str]],
+    report_context: dict[str, Any] | None = None,
 ) -> dict[str, list[str]]:
     exact = sorted({row["Element symbol"] for row in rows if row.get("Element symbol")})
     gene_groups = sorted(
@@ -179,16 +237,17 @@ def normalize_amrfinder(
     )
     report_units = set()
     for row in rows:
+        node = row.get("Hierarchy node", "")
+        if node:
+            report_units.add(node)
+            continue
         accession = row.get("Closest reference accession", "")
         symbol = row.get("Element symbol", "")
-        node = row.get("Hierarchy node", "")
-        unit = report_map.get(accession) or report_map.get(symbol) or report_map.get(node)
+        unit = report_map.get(accession) or report_map.get(symbol)
         if unit:
             report_units.add(unit)
-        elif node:
-            report_units.add(f"hierarchy_node:{gene_group_key(node, hierarchy)}")
         elif symbol:
-            report_units.add(f"exact_gene:{symbol}")
+            report_units.add(symbol)
     return {
         "exact": exact,
         "gene_group": sorted(gene_groups),
@@ -214,6 +273,7 @@ def filter_detector_hits_by_type(payload: dict[str, Any], included_types: set[st
 def normalize_detector(
     payload: dict[str, Any],
     hierarchy: dict[str, dict[str, str]],
+    report_context: dict[str, Any] | None = None,
 ) -> dict[str, list[str]]:
     exact = set()
     gene_groups = set()
@@ -230,12 +290,13 @@ def normalize_detector(
             gene_groups.add(key)
 
         if hit.get("unit_id"):
-            if hit.get("unit_type"):
-                report_units.add(f"{hit['unit_type']}:{hit['unit_id']}")
-            elif hit.get("call_type") == "gene":
-                report_units.add(f"exact_gene:{hit['unit_id']}")
-            elif hit.get("call_type") in {"gene_group", "family"}:
-                report_units.add(f"hierarchy_node:{hit['unit_id']}")
+            unit_type = hit.get("unit_type") or ("exact_gene" if hit.get("call_type") == "gene" else "hierarchy_node")
+            if unit_type == "hierarchy_node":
+                report_units.update(report_unit_coverage(str(hit.get("unit_id", "")), report_context))
+            else:
+                node_for_hit = hit.get("hierarchy_node") or hit.get("gene_group") or hit.get("element_symbol") or hit.get("unit_id", "")
+                if node_for_hit:
+                    report_units.add(str(node_for_hit))
     return {
         "exact": sorted(exact),
         "gene_group": sorted(gene_groups),
@@ -340,6 +401,7 @@ def labels_from_detector_hits(payload: dict[str, Any], field: str, include_blank
 def normalize_detector_hits(
     hits: list[dict[str, Any]],
     hierarchy: dict[str, dict[str, str]],
+    report_context: dict[str, Any] | None = None,
 ) -> dict[str, list[str]]:
     exact = set()
     gene_groups = set()
@@ -356,12 +418,13 @@ def normalize_detector_hits(
             gene_groups.add(key)
 
         if hit.get("unit_id"):
-            if hit.get("unit_type"):
-                report_units.add(f"{hit['unit_type']}:{hit['unit_id']}")
-            elif hit.get("call_type") == "gene":
-                report_units.add(f"exact_gene:{hit['unit_id']}")
-            elif hit.get("call_type") in {"gene_group", "family"}:
-                report_units.add(f"hierarchy_node:{hit['unit_id']}")
+            unit_type = hit.get("unit_type") or ("exact_gene" if hit.get("call_type") == "gene" else "hierarchy_node")
+            if unit_type == "hierarchy_node":
+                report_units.update(report_unit_coverage(str(hit.get("unit_id", "")), report_context))
+            else:
+                node_for_hit = hit.get("hierarchy_node") or hit.get("gene_group") or hit.get("element_symbol") or hit.get("unit_id", "")
+                if node_for_hit:
+                    report_units.add(str(node_for_hit))
     return {
         "exact": sorted(exact),
         "gene_group": sorted(gene_groups),
@@ -434,14 +497,16 @@ def main() -> None:
         for status in status_paths
     }
 
-    report_map_by_key: dict[tuple[str, int], dict[str, str]] = {}
-    universes_by_key: dict[tuple[str, int], dict[str, set[str]]] = {}
+    report_map_by_key: dict[tuple[str, int, str], dict[str, str]] = {}
+    report_context_by_key: dict[tuple[str, int, str], dict[str, Any]] = {}
+    universes_by_key: dict[tuple[str, int, str], dict[str, set[str]]] = {}
     for params in params_by_status.values():
-        key = (str(params["mode"]), int(params["k"]))
+        key = (str(params["mode"]), int(params["k"]), str(params.get("report_unit_strategy", "current")))
         if key in report_map_by_key:
             continue
-        rows = load_report_map_rows(report_map_path(args.report_map_root, key[0], key[1]))
+        rows = load_report_map_rows(report_map_path(args.report_map_root, key[0], key[1], key[2]))
         report_map_by_key[key] = report_map_lookup(rows)
+        report_context_by_key[key] = report_map_context(rows, hierarchy, included_types)
         universes_by_key[key] = metric_universes(rows, hierarchy, included_types)
 
     aggregate_rows = []
@@ -453,8 +518,9 @@ def main() -> None:
 
     for status_csv in status_paths:
         params = params_by_status[status_csv]
-        key = (str(params["mode"]), int(params["k"]))
+        key = (str(params["mode"]), int(params["k"]), str(params.get("report_unit_strategy", "current")))
         report_map = report_map_by_key[key]
+        report_context = report_context_by_key[key]
         universes = universes_by_key[key]
         micro: collections.Counter[str] = collections.Counter()
         species_micro: dict[str, collections.Counter[str]] = collections.defaultdict(collections.Counter)
@@ -477,8 +543,8 @@ def main() -> None:
             native_rows = reportable_rows(Path(baseline_row["tsv_path"]), included_types)
             detector_json_path = resolve_existing_path(row["detector_json"], status_csv.parent)
             detector_payload = filter_detector_hits_by_type(load_json(detector_json_path), included_types)
-            baseline_norm = normalize_amrfinder(native_rows, report_map, hierarchy)
-            detector_norm = normalize_detector(detector_payload, hierarchy)
+            baseline_norm = normalize_amrfinder(native_rows, report_map, hierarchy, report_context)
+            detector_norm = normalize_detector(detector_payload, hierarchy, report_context)
             row_counts = metric_counts(detector_norm, baseline_norm, universes)
             add_counts(micro, row_counts)
 
@@ -486,8 +552,8 @@ def main() -> None:
             add_counts(species_micro[species], row_counts)
 
             for type_label in labels_from_amrfinder_rows(native_rows, "Type") | labels_from_detector_hits(detector_payload, "type_name"):
-                type_baseline = normalize_amrfinder(filter_native_rows(native_rows, "Type", type_label), report_map, hierarchy)
-                type_detector = normalize_detector_hits(filter_detector_hits(detector_payload, "type_name", type_label), hierarchy)
+                type_baseline = normalize_amrfinder(filter_native_rows(native_rows, "Type", type_label), report_map, hierarchy, report_context)
+                type_detector = normalize_detector_hits(filter_detector_hits(detector_payload, "type_name", type_label), hierarchy, report_context)
                 type_items.append((type_label, type_detector, type_baseline))
                 update_universe(type_universes[type_label], type_detector, type_baseline)
 
@@ -508,8 +574,8 @@ def main() -> None:
                     for class_label in class_labels:
                         class_native_rows = filter_native_rows(subtype_native_rows, "Class", class_label)
                         class_hits = filter_detector_hits(subtype_payload, "class_name", class_label)
-                        class_baseline = normalize_amrfinder(class_native_rows, report_map, hierarchy)
-                        class_detector = normalize_detector_hits(class_hits, hierarchy)
+                        class_baseline = normalize_amrfinder(class_native_rows, report_map, hierarchy, report_context)
+                        class_detector = normalize_detector_hits(class_hits, hierarchy, report_context)
 
                         class_key = f"{type_label}||{subtype_label}||{class_label}"
                         class_items.append((class_key, class_detector, class_baseline))
@@ -520,8 +586,8 @@ def main() -> None:
                         update_universe(species_class_universes[species_class_key], class_detector, class_baseline)
 
             for subclass_label in labels_from_amrfinder_rows(native_rows, "Subclass") | labels_from_detector_hits(detector_payload, "subclass"):
-                subclass_baseline = normalize_amrfinder(filter_native_rows(native_rows, "Subclass", subclass_label), report_map, hierarchy)
-                subclass_detector = normalize_detector_hits(filter_detector_hits(detector_payload, "subclass", subclass_label), hierarchy)
+                subclass_baseline = normalize_amrfinder(filter_native_rows(native_rows, "Subclass", subclass_label), report_map, hierarchy, report_context)
+                subclass_detector = normalize_detector_hits(filter_detector_hits(detector_payload, "subclass", subclass_label), hierarchy, report_context)
                 subclass_items.append((subclass_label, subclass_detector, subclass_baseline))
                 update_universe(subclass_universes[subclass_label], subclass_detector, subclass_baseline)
 

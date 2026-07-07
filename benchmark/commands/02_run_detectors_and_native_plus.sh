@@ -26,6 +26,7 @@ uv --directory "$BENCHMARK_DIR" run amr-run-detector-batch \
   --detector-bin "$DETECTOR_BIN" \
   --db-root "$DB" \
   --out-dir "$DETECTOR_OUT" \
+  --report-unit-strategies "$REPORT_UNIT_STRATEGIES" \
   --modes "$MODES" \
   --ks "$KS" \
   --protein-ks "$PROTEIN_KS" \

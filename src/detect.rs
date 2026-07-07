@@ -1,5 +1,5 @@
 use crate::fasta::parse_fasta_bytes;
-use crate::index::{AmrIndex, IndexAlphabet, ReportUnit, ReportUnitKind};
+use crate::index::{AmrIndex, IndexAlphabet, ReportUnit, ReportUnitKind, ReportUnitStrategy};
 use crate::kmer::{DnaKmerIter, ProteinKmerIter};
 use anyhow::ensure;
 use serde::{Deserialize, Serialize};
@@ -171,6 +171,7 @@ pub fn detect_fasta(
             }
         }
 
+        let suppress_ancestors = matches!(index.report_unit_strategy, ReportUnitStrategy::Current);
         let mut suppressed_hierarchy_units = HashSet::<usize>::new();
         for (&unit_id, acc) in &unit_hits {
             let unit = &index.units[unit_id];
@@ -181,11 +182,13 @@ pub fn detect_fasta(
             if fraction < params.min_gene_fraction {
                 continue;
             }
-            suppressed_hierarchy_units.extend(
-                unit.ancestor_unit_ids
-                    .iter()
-                    .map(|&ancestor_id| ancestor_id as usize),
-            );
+            if suppress_ancestors {
+                suppressed_hierarchy_units.extend(
+                    unit.ancestor_unit_ids
+                        .iter()
+                        .map(|&ancestor_id| ancestor_id as usize),
+                );
+            }
             hits.push(unit_hit(
                 index, unit, &record.id, query_kind, index.k, acc, fraction,
             ));
@@ -209,11 +212,13 @@ pub fn detect_fasta(
                 continue;
             }
             let unit = &index.units[unit_id];
-            suppressed_hierarchy_units.extend(
-                unit.ancestor_unit_ids
-                    .iter()
-                    .map(|&ancestor_id| ancestor_id as usize),
-            );
+            if suppress_ancestors {
+                suppressed_hierarchy_units.extend(
+                    unit.ancestor_unit_ids
+                        .iter()
+                        .map(|&ancestor_id| ancestor_id as usize),
+                );
+            }
             hits.push(unit_hit(
                 index, unit, &record.id, query_kind, index.k, acc, fraction,
             ));
@@ -260,7 +265,6 @@ fn expected_alphabet(query_kind: QueryKind) -> IndexAlphabet {
         QueryKind::ProteinCds => IndexAlphabet::Protein,
     }
 }
-
 
 // Recover all the info, including metadata, from the index
 fn unit_hit(
@@ -314,10 +318,6 @@ fn non_empty_option(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
-
-
-
-
 // =============================== TESTS
 
 #[cfg(test)]
@@ -364,6 +364,7 @@ mod tests {
                 k: 5,
                 min_exact_gene_kmers: 0,
                 min_hierarchy_unit_kmers: 1,
+                ..IndexBuildConfig::default()
             },
         )
         .unwrap();
@@ -422,6 +423,7 @@ mod tests {
                 k: 5,
                 min_exact_gene_kmers: 0,
                 min_hierarchy_unit_kmers: 1,
+                ..IndexBuildConfig::default()
             },
         )
         .unwrap();
@@ -480,6 +482,7 @@ ACGTACGTACGT
                 k: 5,
                 min_exact_gene_kmers: 0,
                 min_hierarchy_unit_kmers: 1,
+                ..IndexBuildConfig::default()
             },
         )
         .unwrap();
@@ -531,6 +534,7 @@ ACGTACGTACGT
                 k: 3,
                 min_exact_gene_kmers: 0,
                 min_hierarchy_unit_kmers: 1,
+                ..IndexBuildConfig::default()
             },
         )
         .unwrap();
@@ -586,6 +590,7 @@ ACGTACGTACGT
                 k: 3,
                 min_exact_gene_kmers: 0,
                 min_hierarchy_unit_kmers: 1,
+                ..IndexBuildConfig::default()
             },
         )
         .unwrap();

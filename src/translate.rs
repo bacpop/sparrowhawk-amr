@@ -94,7 +94,6 @@ fn normalize_codon(codon: &[u8]) -> Option<[u8; 3]> {
     Some(out)
 }
 
-
 // ======================================================= TEST
 #[cfg(test)]
 mod tests {

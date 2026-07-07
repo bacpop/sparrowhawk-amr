@@ -7,9 +7,10 @@ mod native {
     use clap::{Parser, Subcommand, ValueEnum};
     use sparrowhawk_amr::{
         DebugMissesConfig, DetectParams, GeneCallerConfig, IndexAlphabet, IndexBuildConfig,
-        QueryKind, ReferenceType, RefinementMode, build_index, debug_amrfinder_misses,
-        detect_fasta, detect_protein_fasta, load_amrfinder_protein_references,
-        load_amrfinder_references, load_index, run_gene_caller, save_index,
+        QueryKind, ReferenceType, RefinementMode, ReportUnitStrategy, build_index,
+        debug_amrfinder_misses, detect_fasta, detect_protein_fasta,
+        load_amrfinder_protein_references, load_amrfinder_references, load_index, run_gene_caller,
+        save_index,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -81,6 +82,8 @@ mod native {
             min_exact_gene_kmers: Option<usize>,
             #[arg(long)]
             min_hierarchy_unit_kmers: Option<usize>,
+            #[arg(long, value_enum, default_value_t = ReportUnitStrategyArg::Current)]
+            report_unit_strategy: ReportUnitStrategyArg,
             #[arg(long, value_enum, value_delimiter = ',', default_values_t = [
                 ReferenceTypeArg::Amr,
                 ReferenceTypeArg::Stress,
@@ -220,6 +223,14 @@ mod native {
         Virulence,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+    enum ReportUnitStrategyArg {
+        Current,
+        ParentOnly,
+        ExactAndParent,
+        ExactAndWeakParent,
+    }
+
     #[derive(Parser, Debug, Clone, Default)]
     struct OrphosArgs {
         #[arg(long)]
@@ -263,6 +274,17 @@ mod native {
         }
     }
 
+    impl From<ReportUnitStrategyArg> for ReportUnitStrategy {
+        fn from(value: ReportUnitStrategyArg) -> Self {
+            match value {
+                ReportUnitStrategyArg::Current => Self::Current,
+                ReportUnitStrategyArg::ParentOnly => Self::ParentOnly,
+                ReportUnitStrategyArg::ExactAndParent => Self::ExactAndParent,
+                ReportUnitStrategyArg::ExactAndWeakParent => Self::ExactAndWeakParent,
+            }
+        }
+    }
+
     impl From<DetectArgs> for DetectParams {
         fn from(value: DetectArgs) -> Self {
             Self {
@@ -290,6 +312,7 @@ mod native {
                     k,
                     min_exact_gene_kmers,
                     min_hierarchy_unit_kmers,
+                    report_unit_strategy,
                     include_types,
                 } => {
                     let alphabet: IndexAlphabet = alphabet.into();
@@ -321,6 +344,7 @@ mod native {
                             k,
                             min_exact_gene_kmers,
                             min_hierarchy_unit_kmers,
+                            report_unit_strategy: report_unit_strategy.into(),
                         },
                     )?;
                     save_index(&index, &out)?;

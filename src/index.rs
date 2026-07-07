@@ -82,6 +82,32 @@ impl Default for IndexAlphabet {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportUnitStrategy {
+    Current,
+    ParentOnly,
+    ExactAndParent,
+    ExactAndWeakParent,
+}
+
+impl Default for ReportUnitStrategy {
+    fn default() -> Self {
+        Self::Current
+    }
+}
+
+impl ReportUnitStrategy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::ParentOnly => "parent_only",
+            Self::ExactAndParent => "exact_and_parent",
+            Self::ExactAndWeakParent => "exact_and_weak_parent",
+        }
+    }
+}
+
 // Struct to work with per-gene info: this is temporal, but used for debugging!
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeneEntry {
@@ -136,6 +162,8 @@ pub struct AmrIndex {
     pub k: usize,
     pub min_exact_gene_kmers: usize,
     pub min_hierarchy_unit_kmers: usize,
+    #[serde(default)]
+    pub report_unit_strategy: ReportUnitStrategy,
     pub strings: Vec<String>,
     pub genes: Vec<GeneEntry>,
     pub units: Vec<ReportUnit>,
@@ -149,6 +177,7 @@ pub struct IndexBuildConfig {
     pub k: usize,
     pub min_exact_gene_kmers: usize,
     pub min_hierarchy_unit_kmers: usize,
+    pub report_unit_strategy: ReportUnitStrategy,
 }
 
 impl Default for IndexBuildConfig {
@@ -158,8 +187,16 @@ impl Default for IndexBuildConfig {
             k: 31,
             min_exact_gene_kmers: 20,
             min_hierarchy_unit_kmers: 20,
+            report_unit_strategy: ReportUnitStrategy::Current,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct ReportUnitSelection {
+    exact_gene_ids: BTreeSet<usize>,
+    selected_node_by_gene: Vec<Option<String>>,
+    hierarchy_nodes: BTreeSet<String>,
 }
 
 impl ReportUnit {
@@ -228,12 +265,13 @@ impl AmrIndex {
         let type_counts = format_counts(self.genes.iter().map(|gene| self.string(gene.type_name)));
         let subtype_counts = format_counts(self.genes.iter().map(|gene| self.string(gene.subtype)));
         format!(
-            "db_version={}\nalphabet={}\nk={}\nmin_exact_gene_kmers={}\nmin_hierarchy_unit_kmers={}\ngenes={}\ngenes_at_or_below_exact_threshold={}\ncollapsed_genes={}\nreport_units={}\nexact_gene_units={}\nhierarchy_units={}\nweak_hierarchy_units={}\nretained_kmers={}\nunit_specific_kmers={}\nindex_bytes_uncompressed_estimate={}\ntype_counts={}\nsubtype_counts={}\n",
+            "db_version={}\nalphabet={}\nk={}\nmin_exact_gene_kmers={}\nmin_hierarchy_unit_kmers={}\nreport_unit_strategy={}\ngenes={}\ngenes_at_or_below_exact_threshold={}\ncollapsed_genes={}\nreport_units={}\nexact_gene_units={}\nhierarchy_units={}\nweak_hierarchy_units={}\nretained_kmers={}\nunit_specific_kmers={}\nindex_bytes_uncompressed_estimate={}\ntype_counts={}\nsubtype_counts={}\n",
             self.db_version,
             self.alphabet.as_str(),
             self.k,
             self.min_exact_gene_kmers,
             self.min_hierarchy_unit_kmers,
+            self.report_unit_strategy.as_str(),
             self.genes.len(),
             genes_at_or_below_exact_threshold,
             collapsed_genes,
@@ -380,12 +418,12 @@ pub fn build_index(
     let node_candidate_counts =
         hierarchy_candidate_counts(&raw_kmers, &gene_paths, &exact_eligible);
 
-    // selection magic
-    let selected_node_by_gene = select_hierarchy_units(
+    let selection = select_report_units(
         &genes,
         &gene_paths,
         &exact_eligible,
         &node_candidate_counts,
+        config.report_unit_strategy,
         config.min_hierarchy_unit_kmers,
     );
 
@@ -393,38 +431,44 @@ pub fn build_index(
     let mut units = Vec::<ReportUnit>::new();
     let mut node_unit_ids = HashMap::<String, UnitId>::new();
     // First, exact genes
-    for gene_id in 0..genes.len() {
-        if !exact_eligible[gene_id] {
-            continue;
-        }
+    for &gene_id in &selection.exact_gene_ids {
         let unit_id = checked_unit_id(units.len())?;
         genes[gene_id].report_unit_id = unit_id;
         units.push(exact_unit(checked_gene_id(gene_id)?, &genes[gene_id]));
     }
 
     // Now the superior hiearchical nodes
-    let selected_nodes: BTreeSet<String> = selected_node_by_gene
-        .iter()
-        .filter_map(|node| node.clone())
-        .collect();
-    for node_id in selected_nodes {
+    for node_id in &selection.hierarchy_nodes {
         let unit_id = checked_unit_id(units.len())?;
         node_unit_ids.insert(node_id.clone(), unit_id);
+        let member_gene_ids = if matches!(
+            config.report_unit_strategy,
+            ReportUnitStrategy::Current | ReportUnitStrategy::ExactAndParent
+        ) {
+            Vec::new()
+        } else {
+            selection
+                .selected_node_by_gene
+                .iter()
+                .enumerate()
+                .filter_map(|(gene_id, selected_node)| {
+                    (selected_node.as_deref() == Some(node_id.as_str())).then_some(gene_id)
+                })
+                .collect::<Vec<_>>()
+        };
         units.push(hierarchy_unit(
-            &node_id,
+            node_id,
             &node_meta,
             &node_to_genes,
             &node_candidate_counts,
             config.min_hierarchy_unit_kmers,
+            &member_gene_ids,
             &mut interner,
         )?);
     }
 
-    // Assign an exact gene (for debug) to a report unit
-    for (gene_id, selected_node) in selected_node_by_gene.iter().enumerate() {
-        if exact_eligible[gene_id] {
-            continue;
-        }
+    // Assign every non-exact/report-unit-collapsed gene to its hierarchy unit for debug/report maps.
+    for (gene_id, selected_node) in selection.selected_node_by_gene.iter().enumerate() {
         let Some(node_id) = selected_node else {
             continue;
         };
@@ -440,12 +484,18 @@ pub fn build_index(
     // Write the k-mers
     let mut retained = Vec::<(u64, UnitId)>::new();
     for (kmer, refs) in raw_kmers {
-        if refs.len() == 1 && exact_eligible[refs[0]] {
+        if refs.len() == 1 && selection.exact_gene_ids.contains(&refs[0]) {
             retained.push((kmer, genes[refs[0]].report_unit_id));
             continue;
         }
-        let Some(unit_id) = lowest_selected_hierarchy_unit(&refs, &gene_paths, &node_unit_ids)
-        else {
+        let Some(unit_id) = selected_hierarchy_unit_for_kmer(
+            &refs,
+            &selection.selected_node_by_gene,
+            &gene_paths,
+            &node_unit_ids,
+            config.report_unit_strategy,
+            &exact_eligible,
+        ) else {
             continue;
         };
         retained.push((kmer, unit_id));
@@ -471,6 +521,7 @@ pub fn build_index(
         k: config.k,
         min_exact_gene_kmers: config.min_exact_gene_kmers,
         min_hierarchy_unit_kmers: config.min_hierarchy_unit_kmers,
+        report_unit_strategy: config.report_unit_strategy,
         strings: interner.strings,
         genes,
         units,
@@ -587,7 +638,7 @@ fn hierarchy_candidate_counts(
     counts
 }
 
-/// Main function for selecting which other superior hierarchy units we choose
+/// Main function for selecting which superior hierarchy units we choose for weak genes.
 fn select_hierarchy_units(
     genes: &[GeneEntry],
     gene_paths: &[Vec<String>],
@@ -600,33 +651,101 @@ fn select_hierarchy_units(
         if exact_eligible[gene_id] {
             continue;
         }
+        selected[gene_id] = best_hierarchy_node_for_gene(
+            &gene_paths[gene_id],
+            node_candidate_counts,
+            min_hierarchy_unit_kmers,
+        );
+    }
+    selected
+}
 
-        let path = &gene_paths[gene_id];
+fn best_hierarchy_node_for_gene(
+    path: &[String],
+    node_candidate_counts: &HashMap<String, usize>,
+    min_hierarchy_unit_kmers: usize,
+) -> Option<String> {
+    path.iter()
+        .find(|node_id| {
+            node_candidate_counts
+                .get(*node_id)
+                .copied()
+                .unwrap_or_default()
+                >= min_hierarchy_unit_kmers
+        })
+        .cloned()
+        .or_else(|| {
+            path.iter()
+                .max_by_key(|node_id| {
+                    node_candidate_counts
+                        .get(*node_id)
+                        .copied()
+                        .unwrap_or_default()
+                })
+                .cloned()
+        })
+}
 
-        selected[gene_id] = path
-            .iter()
-            .find(|node_id| {
-                node_candidate_counts
-                    .get(*node_id)
-                    .copied()
-                    .unwrap_or_default()
-                    >= min_hierarchy_unit_kmers
-            })
-            .cloned()
-            .or_else(|| {
-                // If not a suitable one has been found, let's get the largest one possible
-                path.iter()
-                    .max_by_key(|node_id| {
-                        node_candidate_counts
-                            .get(*node_id)
-                            .copied()
-                            .unwrap_or_default()
-                    })
-                    .cloned()
-            });
+fn select_report_units(
+    genes: &[GeneEntry],
+    gene_paths: &[Vec<String>],
+    exact_eligible: &[bool],
+    node_candidate_counts: &HashMap<String, usize>,
+    strategy: ReportUnitStrategy,
+    min_hierarchy_unit_kmers: usize,
+) -> ReportUnitSelection {
+    let weak_selected = select_hierarchy_units(
+        genes,
+        gene_paths,
+        exact_eligible,
+        node_candidate_counts,
+        min_hierarchy_unit_kmers,
+    );
+    let weak_nodes: BTreeSet<String> = weak_selected.iter().filter_map(Clone::clone).collect();
+    let mut exact_gene_ids: BTreeSet<usize> = exact_eligible
+        .iter()
+        .enumerate()
+        .filter_map(|(gene_id, &eligible)| eligible.then_some(gene_id))
+        .collect();
+    let mut selected_node_by_gene = weak_selected;
+
+    match strategy {
+        ReportUnitStrategy::Current
+        | ReportUnitStrategy::ExactAndParent
+        | ReportUnitStrategy::ExactAndWeakParent => {}
+        ReportUnitStrategy::ParentOnly => {
+            for gene_id in 0..genes.len() {
+                if selected_node_by_gene[gene_id].is_some() {
+                    continue;
+                }
+                if let Some(node_id) =
+                    first_matching_selected_node(&gene_paths[gene_id], &weak_nodes)
+                {
+                    selected_node_by_gene[gene_id] = Some(node_id);
+                    exact_gene_ids.remove(&gene_id);
+                }
+            }
+        }
     }
 
-    selected
+    let hierarchy_nodes = selected_node_by_gene
+        .iter()
+        .filter_map(Clone::clone)
+        .collect();
+    ReportUnitSelection {
+        exact_gene_ids,
+        selected_node_by_gene,
+        hierarchy_nodes,
+    }
+}
+
+fn first_matching_selected_node(
+    path: &[String],
+    selected_nodes: &BTreeSet<String>,
+) -> Option<String> {
+    path.iter()
+        .find(|node_id| selected_nodes.contains(*node_id))
+        .cloned()
 }
 
 fn exact_unit(gene_id: GeneId, gene: &GeneEntry) -> ReportUnit {
@@ -658,6 +777,7 @@ fn hierarchy_unit(
     node_to_genes: &HashMap<String, HashSet<usize>>,
     node_candidate_counts: &HashMap<String, usize>,
     min_hierarchy_unit_kmers: usize,
+    selected_member_gene_ids: &[usize],
     interner: &mut StringInterner,
 ) -> anyhow::Result<ReportUnit> {
     let meta = node_meta.get(node_id).ok_or_else(|| {
@@ -668,10 +788,17 @@ fn hierarchy_unit(
             node_candidate_counts.get(node_id).copied().unwrap_or_default()
         )
     })?;
-    let mut member_gene_ids: Vec<GeneId> = node_to_genes
-        .get(node_id)
-        .into_iter()
-        .flat_map(|genes| genes.iter())
+    let member_source: Vec<usize> = if selected_member_gene_ids.is_empty() {
+        node_to_genes
+            .get(node_id)
+            .into_iter()
+            .flat_map(|genes| genes.iter().copied())
+            .collect()
+    } else {
+        selected_member_gene_ids.to_vec()
+    };
+    let mut member_gene_ids: Vec<GeneId> = member_source
+        .iter()
         .map(|&gene_id| checked_gene_id(gene_id))
         .collect::<anyhow::Result<Vec<_>>>()?;
     member_gene_ids.sort_unstable();
@@ -753,6 +880,46 @@ fn fill_unit_ancestors(
     }
 }
 
+fn selected_hierarchy_unit_for_kmer(
+    refs: &[usize],
+    selected_node_by_gene: &[Option<String>],
+    gene_paths: &[Vec<String>],
+    node_unit_ids: &HashMap<String, UnitId>,
+    strategy: ReportUnitStrategy,
+    exact_eligible: &[bool],
+) -> Option<UnitId> {
+    match strategy {
+        ReportUnitStrategy::Current | ReportUnitStrategy::ExactAndParent => {
+            lowest_selected_hierarchy_unit(refs, gene_paths, node_unit_ids)
+        }
+        ReportUnitStrategy::ParentOnly => selected_node_for_refs(refs, selected_node_by_gene)
+            .and_then(|node_id| node_unit_ids.get(&node_id).copied()),
+        ReportUnitStrategy::ExactAndWeakParent => {
+            let weak_refs: Vec<usize> = refs
+                .iter()
+                .copied()
+                .filter(|&gene_id| !exact_eligible[gene_id])
+                .collect();
+            if weak_refs.is_empty() {
+                return None;
+            }
+            selected_node_for_refs(&weak_refs, selected_node_by_gene)
+                .and_then(|node_id| node_unit_ids.get(&node_id).copied())
+        }
+    }
+}
+
+fn selected_node_for_refs(
+    refs: &[usize],
+    selected_node_by_gene: &[Option<String>],
+) -> Option<String> {
+    let mut nodes = refs
+        .iter()
+        .filter_map(|&gene_id| selected_node_by_gene.get(gene_id)?.clone());
+    let first = nodes.next()?;
+    nodes.all(|node_id| node_id == first).then_some(first)
+}
+
 fn lowest_selected_hierarchy_unit(
     refs: &[usize],
     gene_paths: &[Vec<String>],
@@ -830,6 +997,7 @@ mod tests {
                 k: 5,
                 min_exact_gene_kmers: 0,
                 min_hierarchy_unit_kmers: 1,
+                ..IndexBuildConfig::default()
             },
         )
         .unwrap();
@@ -849,6 +1017,7 @@ mod tests {
                 k: 5,
                 min_exact_gene_kmers: 0,
                 min_hierarchy_unit_kmers: 1,
+                ..IndexBuildConfig::default()
             },
         )
         .unwrap();
@@ -862,6 +1031,7 @@ mod tests {
                 k: 5,
                 min_exact_gene_kmers: exact_count,
                 min_hierarchy_unit_kmers: 1,
+                ..IndexBuildConfig::default()
             },
         )
         .unwrap();
@@ -885,6 +1055,7 @@ mod tests {
                 k: 3,
                 min_exact_gene_kmers: 5,
                 min_hierarchy_unit_kmers: 1,
+                ..IndexBuildConfig::default()
             },
         )
         .unwrap();
@@ -894,6 +1065,102 @@ mod tests {
         assert_eq!(index.units[0].kind(), ReportUnitKind::HierarchyNode);
         assert!(!index.kmer_codes.is_empty());
     }
+
+    #[test]
+    fn report_unit_strategies_handle_mixed_exact_and_weak_siblings() {
+        let refs = vec![
+            reference("exact", "child_a", b"AAAAACCCCCGGGGGGGGGG"),
+            reference("weak1", "child_b", b"AAAAACCCCC"),
+            reference("weak2", "child_c", b"AAAAACCCCC"),
+        ]
+        .into_iter()
+        .map(|mut reference| {
+            reference.hierarchy_path.push(HierarchyNode {
+                node_id: "parent".to_string(),
+                parent_node_id: String::new(),
+                symbol: "parent".to_string(),
+                class_name: "CLASS".to_string(),
+                subclass: "SUBCLASS".to_string(),
+                scope: "core".to_string(),
+                type_name: "AMR".to_string(),
+                subtype: "AMR".to_string(),
+                reportable: 2,
+            });
+            reference
+        })
+        .collect::<Vec<_>>();
+
+        let build = |strategy| {
+            build_index(
+                &refs,
+                &IndexBuildConfig {
+                    alphabet: IndexAlphabet::Dna,
+                    k: 5,
+                    min_exact_gene_kmers: 1,
+                    min_hierarchy_unit_kmers: 1,
+                    report_unit_strategy: strategy,
+                },
+            )
+            .unwrap()
+        };
+
+        let current = build(ReportUnitStrategy::Current);
+        assert_eq!(current.report_unit_strategy, ReportUnitStrategy::Current);
+        assert!(
+            current
+                .units
+                .iter()
+                .any(|unit| unit.kind() == ReportUnitKind::ExactGene)
+        );
+        assert!(
+            current
+                .units
+                .iter()
+                .any(|unit| unit.kind() == ReportUnitKind::HierarchyNode)
+        );
+
+        let parent_only = build(ReportUnitStrategy::ParentOnly);
+        assert_eq!(
+            parent_only.report_unit_strategy,
+            ReportUnitStrategy::ParentOnly
+        );
+        assert!(
+            parent_only
+                .units
+                .iter()
+                .all(|unit| unit.kind() == ReportUnitKind::HierarchyNode)
+        );
+        assert!(parent_only.units.iter().any(|unit| unit.member_count == 3));
+
+        let exact_and_parent = build(ReportUnitStrategy::ExactAndParent);
+        assert!(
+            exact_and_parent
+                .units
+                .iter()
+                .any(|unit| unit.kind() == ReportUnitKind::ExactGene)
+        );
+        assert!(
+            exact_and_parent
+                .units
+                .iter()
+                .any(|unit| unit.kind() == ReportUnitKind::HierarchyNode)
+        );
+
+        let exact_and_weak_parent = build(ReportUnitStrategy::ExactAndWeakParent);
+        assert!(
+            exact_and_weak_parent
+                .units
+                .iter()
+                .any(|unit| unit.kind() == ReportUnitKind::ExactGene)
+        );
+        assert!(
+            exact_and_weak_parent
+                .units
+                .iter()
+                .any(|unit| unit.kind() == ReportUnitKind::HierarchyNode && unit.member_count < 3)
+        );
+    }
+
     #[test]
     fn index_preserves_reference_category_metadata() {
         let mut refs = vec![reference("stress1", "metal_node", b"ACGTACGTAC")];
@@ -908,6 +1175,7 @@ mod tests {
                 k: 5,
                 min_exact_gene_kmers: 0,
                 min_hierarchy_unit_kmers: 1,
+                ..IndexBuildConfig::default()
             },
         )
         .unwrap();

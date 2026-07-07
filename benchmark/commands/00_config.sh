@@ -34,6 +34,7 @@ FETCH_RETRY_JOBS="${FETCH_RETRY_JOBS:-1}"
 FETCH_RETRY_SLEEP="${FETCH_RETRY_SLEEP:-30}"
 
 # Detector defaults. Keep this to one k value; no sweep.
+REPORT_UNIT_STRATEGIES="${REPORT_UNIT_STRATEGIES:-current}"
 MODES="${MODES:-direct}"
 KS="${KS:-31}"
 PROTEIN_KS="${PROTEIN_KS:-5}"

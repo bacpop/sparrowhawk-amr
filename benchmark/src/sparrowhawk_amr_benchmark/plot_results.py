@@ -59,6 +59,7 @@ LABEL_SIZE = 9
 TITLE_SIZE = 11
 DEFAULT_FORMATS = ("png", "pdf", "svg")
 CONFIG_COLUMNS = (
+    "report_unit_strategy",
     "mode",
     "k",
     "threshold_mode",

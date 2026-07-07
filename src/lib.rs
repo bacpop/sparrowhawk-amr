@@ -21,8 +21,8 @@ pub use detect::{
 #[cfg(not(target_family = "wasm"))]
 pub use gene_callers::{GeneCaller, GeneCallerConfig, run_gene_caller};
 pub use index::{
-    AmrIndex, IndexAlphabet, IndexBuildConfig, ReportUnit, ReportUnitKind, build_index,
-    load_index_from_bytes,
+    AmrIndex, IndexAlphabet, IndexBuildConfig, ReportUnit, ReportUnitKind, ReportUnitStrategy,
+    build_index, load_index_from_bytes,
 };
 #[cfg(not(target_family = "wasm"))]
 pub use index::{load_index, save_index};
@@ -71,7 +71,7 @@ impl AmrDetector {
         min_gene_fraction: f64,
         min_gene_group_fraction: f64,
     ) -> Result<String, JsValue> {
-        validate_fraction("min_gene_fraction", min_gene_fraction)?;             // Probably not needed...
+        validate_fraction("min_gene_fraction", min_gene_fraction)?; // Probably not needed...
         validate_fraction("min_gene_group_fraction", min_gene_group_fraction)?; // Probably not needed...
         let params = DetectParams {
             min_gene_fraction,
@@ -96,7 +96,7 @@ impl AmrDetector {
         min_gene_fraction: f64,
         min_gene_group_fraction: f64,
     ) -> Result<String, JsValue> {
-        validate_fraction("min_gene_fraction", min_gene_fraction)?;             // Probably not needed...
+        validate_fraction("min_gene_fraction", min_gene_fraction)?; // Probably not needed...
         validate_fraction("min_gene_group_fraction", min_gene_group_fraction)?; // Probably not needed...
         let params = DetectParams {
             min_gene_fraction,

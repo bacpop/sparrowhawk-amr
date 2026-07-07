@@ -19,6 +19,7 @@ def run_build_index(
     alphabet: str,
     min_exact_gene_kmers: int,
     min_hierarchy_unit_kmers: int,
+    report_unit_strategy: str,
 ) -> None:
     ensure_dir(index_path.parent)
     result = run_and_time(
@@ -38,6 +39,8 @@ def run_build_index(
             str(min_exact_gene_kmers),
             "--min-hierarchy-unit-kmers",
             str(min_hierarchy_unit_kmers),
+            "--report-unit-strategy",
+            report_unit_strategy.replace("_", "-"),
         ]
     )
     if result["returncode"] != 0:
@@ -167,6 +170,10 @@ def parse_csv_floats(raw: str) -> list[float]:
     return [float(part.strip()) for part in raw.split(",") if part.strip()]
 
 
+def parse_csv_strs(raw: str) -> list[str]:
+    return [part.strip().replace("-", "_") for part in raw.split(",") if part.strip()]
+
+
 def parse_csv_modes(raw: str) -> list[str]:
     modes = []
     for part in raw.split(","):
@@ -195,6 +202,12 @@ def main() -> None:
     parser.add_argument("--modes", type=str, default="direct")
     parser.add_argument("--ks", type=str, default="15,17,21,31")
     parser.add_argument("--protein-ks", type=str, default="5")
+    parser.add_argument(
+        "--report-unit-strategies",
+        type=str,
+        default="current",
+        help="Comma-separated strategies: current,parent_only,exact_and_parent,exact_and_weak_parent",
+    )
     parser.add_argument("--min-gene-fractions", type=str, default="0.02,0.05,0.10")
     parser.add_argument(
         "--min-report-unit-fractions",
@@ -222,62 +235,78 @@ def main() -> None:
     protein_ks = parse_csv_ints(args.protein_ks)
     gene_fractions = parse_csv_floats(args.min_gene_fractions)
     gene_group_fractions = parse_csv_floats(args.min_gene_group_fractions)
+    strategies = parse_csv_strs(args.report_unit_strategies)
+    allowed_strategies = {"current", "parent_only", "exact_and_parent", "exact_and_weak_parent"}
+    unknown = sorted(set(strategies) - allowed_strategies)
+    if unknown:
+        raise ValueError(f"unknown report-unit strategies: {', '.join(unknown)}")
 
-    for mode in modes:
-        mode_ks = protein_ks if mode == "protein_cds" else ks
-        alphabet = "protein" if mode == "protein_cds" else "dna"
-        min_exact = (
-            args.protein_min_exact_gene_kmers
-            if mode == "protein_cds"
-            else args.min_exact_gene_kmers
-        )
-        min_hierarchy = (
-            args.protein_min_hierarchy_unit_kmers
-            if mode == "protein_cds"
-            else args.min_hierarchy_unit_kmers
-        )
-        for k in mode_ks:
-            index_path = ensure_dir(args.out_dir / "indexes") / f"{alphabet}_k{k}.amridx"
-            run_build_index(detector_bin, args.db_root, index_path, k, alphabet, min_exact, min_hierarchy)
-            run_report_map(
-                detector_bin,
-                index_path,
-                ensure_dir(args.out_dir / "report_maps") / f"{alphabet}_k{k}.tsv",
+    for strategy in strategies:
+        for mode in modes:
+            mode_ks = protein_ks if mode == "protein_cds" else ks
+            alphabet = "protein" if mode == "protein_cds" else "dna"
+            min_exact = (
+                args.protein_min_exact_gene_kmers
+                if mode == "protein_cds"
+                else args.min_exact_gene_kmers
             )
-            for min_gene in gene_fractions:
-                gene_label = format_fraction_label(min_gene)
-                for min_family in gene_group_fractions:
-                    gene_group_label = format_fraction_label(min_family)
-                    result_dir = ensure_dir(
-                        args.out_dir / mode / f"k_{k}" / f"gf_{gene_label}__ff_{gene_group_label}"
-                    )
-                    results = []
-                    with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-                        futures = [
-                            pool.submit(
-                                run_one,
-                                row,
-                                detector_bin,
-                                index_path,
-                                result_dir,
-                                min_gene,
-                                min_family,
-                                mode,
-                                ensure_dir(args.out_dir / "gene_calls"),
-                            )
-                            for row in manifest_rows
-                        ]
-                        for future in as_completed(futures):
-                            results.append(future.result())
-                    ordered = sorted(results, key=lambda row: (row["species"], row["assembly_id"]))
-                    write_csv(
-                        args.out_dir
-                        / mode
-                        / f"k_{k}"
-                        / f"gf_{gene_label}__ff_{gene_group_label}_status.csv",
-                        list(ordered[0].keys()) if ordered else [],
-                        ordered,
-                    )
+            min_hierarchy = (
+                args.protein_min_hierarchy_unit_kmers
+                if mode == "protein_cds"
+                else args.min_hierarchy_unit_kmers
+            )
+            for k in mode_ks:
+                index_path = ensure_dir(args.out_dir / "indexes" / strategy) / f"{alphabet}_k{k}.amridx"
+                run_build_index(
+                    detector_bin,
+                    args.db_root,
+                    index_path,
+                    k,
+                    alphabet,
+                    min_exact,
+                    min_hierarchy,
+                    strategy,
+                )
+                run_report_map(
+                    detector_bin,
+                    index_path,
+                    ensure_dir(args.out_dir / "report_maps" / strategy) / f"{alphabet}_k{k}.tsv",
+                )
+                for min_gene in gene_fractions:
+                    gene_label = format_fraction_label(min_gene)
+                    for min_family in gene_group_fractions:
+                        gene_group_label = format_fraction_label(min_family)
+                        result_dir = ensure_dir(
+                            args.out_dir / strategy / mode / f"k_{k}" / f"gf_{gene_label}__ff_{gene_group_label}"
+                        )
+                        results = []
+                        with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+                            futures = [
+                                pool.submit(
+                                    run_one,
+                                    row,
+                                    detector_bin,
+                                    index_path,
+                                    result_dir,
+                                    min_gene,
+                                    min_family,
+                                    mode,
+                                    ensure_dir(args.out_dir / "gene_calls" / strategy),
+                                )
+                                for row in manifest_rows
+                            ]
+                            for future in as_completed(futures):
+                                results.append(future.result())
+                        ordered = sorted(results, key=lambda row: (row["species"], row["assembly_id"]))
+                        write_csv(
+                            args.out_dir
+                            / strategy
+                            / mode
+                            / f"k_{k}"
+                            / f"gf_{gene_label}__ff_{gene_group_label}_status.csv",
+                            list(ordered[0].keys()) if ordered else [],
+                            ordered,
+                        )
 
 
 if __name__ == "__main__":
