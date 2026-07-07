@@ -181,11 +181,6 @@ pub fn detect_fasta(
             if fraction < params.min_gene_fraction {
                 continue;
             }
-            suppressed_hierarchy_units.extend(
-                unit.ancestor_unit_ids
-                    .iter()
-                    .map(|&ancestor_id| ancestor_id as usize),
-            );
             hits.push(unit_hit(
                 index, unit, &record.id, query_kind, index.k, acc, fraction,
             ));
@@ -261,7 +256,6 @@ fn expected_alphabet(query_kind: QueryKind) -> IndexAlphabet {
     }
 }
 
-
 // Recover all the info, including metadata, from the index
 fn unit_hit(
     index: &AmrIndex,
@@ -313,10 +307,6 @@ fn unit_hit(
 fn non_empty_option(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
-
-
-
-
 
 // =============================== TESTS
 
@@ -382,6 +372,95 @@ mod tests {
         assert_eq!(result.gene_count, 1);
         assert_eq!(result.hits[0].type_name.as_deref(), Some("AMR"));
         assert_eq!(result.hits[0].subtype.as_deref(), Some("AMR"));
+    }
+
+    #[test]
+    fn exact_gene_hit_does_not_suppress_parent_hierarchy_hit() {
+        let child = |id: &str, node: &str, seq: &[u8]| AmrReference {
+            protein_accession: id.to_string(),
+            nucleotide_accession: id.to_string(),
+            element_symbol: id.to_string(),
+            gene_symbol: id.to_string(),
+            allele_symbol: id.to_string(),
+            product: String::new(),
+            family: node.to_string(),
+            class_name: "CLASS".to_string(),
+            subclass: "SUB".to_string(),
+            hierarchy_node: node.to_string(),
+            scope: "core".to_string(),
+            type_name: "AMR".to_string(),
+            subtype: "AMR".to_string(),
+            reportable: 2,
+            hierarchy_path: vec![
+                HierarchyNode {
+                    node_id: node.to_string(),
+                    parent_node_id: "parent".to_string(),
+                    symbol: node.to_string(),
+                    class_name: "CLASS".to_string(),
+                    subclass: "SUB".to_string(),
+                    scope: "core".to_string(),
+                    type_name: "AMR".to_string(),
+                    subtype: "AMR".to_string(),
+                    reportable: 2,
+                },
+                HierarchyNode {
+                    node_id: "parent".to_string(),
+                    parent_node_id: String::new(),
+                    symbol: "parent".to_string(),
+                    class_name: "CLASS".to_string(),
+                    subclass: "SUB".to_string(),
+                    scope: "core".to_string(),
+                    type_name: "AMR".to_string(),
+                    subtype: "AMR".to_string(),
+                    reportable: 2,
+                },
+            ],
+            db_version: "test".to_string(),
+            seq: seq.to_vec(),
+        };
+        let refs = vec![
+            child("exact", "child_a", b"AAAAACCCCCGGGGGGGGGG"),
+            child("weak1", "child_b", b"AAAAACCCCC"),
+            child("weak2", "child_c", b"AAAAACCCCC"),
+        ];
+        let index = build_index(
+            &refs,
+            &IndexBuildConfig {
+                alphabet: IndexAlphabet::Dna,
+                k: 5,
+                min_exact_gene_kmers: 1,
+                min_hierarchy_unit_kmers: 1,
+            },
+        )
+        .unwrap();
+
+        let result = detect_fasta(
+            &index,
+            b">contig\nAAAAACCCCCGGGGGGGGGG\n",
+            "sample",
+            QueryKind::Direct,
+            &DetectParams {
+                min_gene_fraction: 0.5,
+                min_gene_group_fraction: 0.5,
+                ..DetectParams::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.gene_count, 1);
+        assert_eq!(result.gene_group_count, 1);
+        assert!(
+            result
+                .hits
+                .iter()
+                .any(|hit| hit.call_type == "gene" && hit.unit_id == "exact|exact")
+        );
+        assert!(
+            result
+                .hits
+                .iter()
+                .any(|hit| hit.call_type == "gene_group" && hit.unit_id == "parent")
+        );
     }
 
     #[test]
