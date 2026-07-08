@@ -198,6 +198,14 @@ def ordered_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
     return sorted(rows, key=lambda row: (row.get("species", ""), row["assembly_id"]))
 
 
+def print_final_missing_ids(rows: list[dict[str, str]]) -> None:
+    if not rows:
+        return
+    print("Assemblies still missing after all retries:", file=sys.stderr)
+    for row in ordered_rows(rows):
+        print(f"  {row['assembly_id']}", file=sys.stderr)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Fetch assembly FASTAs for AMR benchmark cohort")
     parser.add_argument("--manifest", type=Path, required=True)
@@ -262,6 +270,7 @@ def main() -> None:
             f"{len(final_missing)} expected FASTA files are still missing after all retries; details: {missing_csv}",
             file=sys.stderr,
         )
+        print_final_missing_ids(final_missing)
         if not args.allow_missing:
             raise SystemExit(1)
     elif missing_csv.exists():
