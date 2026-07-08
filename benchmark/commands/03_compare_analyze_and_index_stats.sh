@@ -51,9 +51,6 @@ uv --directory "$BENCHMARK_DIR" run amr-compare-amrfinder-batch \
   --detector-root "$DETECTOR_OUT" \
   --report-map-root "$REPORT_MAP_ROOT" \
   --unit-stats-root "$UNIT_STATS_ROOT" \
-  --detector-bin "$DETECTOR_BIN" \
-  --detector-root "$DETECTOR_OUT" \
-  --db-dir "$DB" \
   --hierarchy "$HIERARCHY" \
   --include-types "$INCLUDE_TYPES" \
   --out-dir "$COMPARISON_OUT" \
