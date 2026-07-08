@@ -65,6 +65,27 @@ def run_report_map(detector_bin: Path, index_path: Path, report_map_path: Path) 
         )
 
 
+def run_unit_stats(detector_bin: Path, db_root: Path, index_path: Path, unit_stats_path: Path) -> None:
+    ensure_dir(unit_stats_path.parent)
+    result = run_and_time(
+        [
+            str(detector_bin),
+            "index",
+            "unit-stats",
+            "--index",
+            str(index_path),
+            "--db-dir",
+            str(db_root),
+            "--out",
+            str(unit_stats_path),
+        ]
+    )
+    if result["returncode"] != 0:
+        raise RuntimeError(
+            result["stderr"] or result["stdout"] or f"unit-stats failed for {index_path}"
+        )
+
+
 def run_one(
     row: dict[str, str],
     detector_bin: Path,
@@ -243,6 +264,12 @@ def main() -> None:
                 detector_bin,
                 index_path,
                 ensure_dir(args.out_dir / "report_maps") / f"{alphabet}_k{k}.tsv",
+            )
+            run_unit_stats(
+                detector_bin,
+                args.db_root,
+                index_path,
+                ensure_dir(args.out_dir / "unit_stats") / f"{alphabet}_k{k}.tsv",
             )
             for min_gene in gene_fractions:
                 gene_label = format_fraction_label(min_gene)

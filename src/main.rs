@@ -7,9 +7,10 @@ mod native {
     use clap::{Parser, Subcommand, ValueEnum};
     use sparrowhawk_amr::{
         DebugMissesConfig, DetectParams, GeneCallerConfig, IndexAlphabet, IndexBuildConfig,
-        QueryKind, ReferenceType, RefinementMode, build_index, debug_amrfinder_misses,
-        detect_fasta, detect_protein_fasta, load_amrfinder_protein_references,
-        load_amrfinder_references, load_index, run_gene_caller, save_index,
+        QueryKind, ReferenceType, RefinementMode, TruthKmerEvidenceConfig, build_index,
+        debug_amrfinder_misses, detect_fasta, detect_protein_fasta,
+        load_amrfinder_protein_references, load_amrfinder_references, load_index, run_gene_caller,
+        save_index,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -98,6 +99,14 @@ mod native {
             #[arg(long)]
             out: Option<PathBuf>,
         },
+        UnitStats {
+            #[arg(long)]
+            index: PathBuf,
+            #[arg(long)]
+            db_dir: Option<PathBuf>,
+            #[arg(long)]
+            out: Option<PathBuf>,
+        },
     }
 
     #[derive(Subcommand)]
@@ -175,6 +184,30 @@ mod native {
             refinement_k: usize,
             #[arg(long, default_value_t = 5)]
             missing_kmer_limit: usize,
+            #[arg(long)]
+            out: Option<PathBuf>,
+        },
+        TruthKmerEvidence {
+            #[arg(long)]
+            index: PathBuf,
+            #[arg(long)]
+            assembly: PathBuf,
+            #[arg(long)]
+            amrfinder_tsv: PathBuf,
+            #[arg(long)]
+            detector_json: PathBuf,
+            #[arg(long)]
+            db_dir: Option<PathBuf>,
+            #[arg(long, value_enum, value_delimiter = ',', default_values_t = [
+                ReferenceTypeArg::Amr,
+                ReferenceTypeArg::Stress,
+                ReferenceTypeArg::Virulence,
+            ])]
+            include_types: Vec<ReferenceTypeArg>,
+            #[arg(long, default_value_t = 0.10)]
+            min_gene_fraction: f64,
+            #[arg(long, default_value_t = 0.10)]
+            min_family_fraction: f64,
             #[arg(long)]
             out: Option<PathBuf>,
         },
@@ -343,6 +376,17 @@ mod native {
                     }
                     Ok(())
                 }
+                IndexCommand::UnitStats { index, db_dir, out } => {
+                    let index = load_index(&index)?;
+                    let text = unit_stats_tsv(&index, db_dir.as_deref())?;
+                    if let Some(out) = out {
+                        fs::write(&out, text)
+                            .with_context(|| format!("write {}", out.display()))?;
+                    } else {
+                        print!("{text}");
+                    }
+                    Ok(())
+                }
             },
             CommandKind::Detect { command } => match command {
                 DetectCommand::Direct {
@@ -478,6 +522,26 @@ mod native {
                     missing_kmer_limit,
                     out.as_deref(),
                 ),
+                EvalCommand::TruthKmerEvidence {
+                    index,
+                    assembly,
+                    amrfinder_tsv,
+                    detector_json,
+                    db_dir: _,
+                    include_types,
+                    min_gene_fraction,
+                    min_family_fraction,
+                    out,
+                } => run_truth_kmer_evidence(
+                    &index,
+                    &assembly,
+                    &amrfinder_tsv,
+                    &detector_json,
+                    &include_types,
+                    min_gene_fraction,
+                    min_family_fraction,
+                    out.as_deref(),
+                ),
             },
         }
     }
@@ -504,6 +568,139 @@ mod native {
             ));
         }
         out
+    }
+
+    #[derive(Debug, Default, Clone)]
+    struct FamThresholds {
+        complete_ident: String,
+        complete_wp_coverage: String,
+        complete_br_coverage: String,
+        partial_ident: String,
+        partial_wp_coverage: String,
+        partial_br_coverage: String,
+        reportable: String,
+        family_name: String,
+    }
+
+    fn unit_stats_tsv(
+        index: &sparrowhawk_amr::AmrIndex,
+        db_dir: Option<&Path>,
+    ) -> anyhow::Result<String> {
+        let fam = if let Some(db_dir) = db_dir {
+            load_fam_thresholds(&db_dir.join("fam.tsv"))?
+        } else {
+            std::collections::HashMap::new()
+        };
+        let mut out = String::from(
+            "unit_id\tunit_key\tunit_type\tunit_label\telement_symbol\tgene_symbol\tallele_symbol\tgene_group\thierarchy_node\ttype\tsubtype\tclass\tsubclass\tdiagnostic_kmers\tmember_genes\tis_weak_hierarchy_unit\tblastrule_complete_ident\tblastrule_complete_wp_coverage\tblastrule_complete_br_coverage\tblastrule_partial_ident\tblastrule_partial_wp_coverage\tblastrule_partial_br_coverage\treportable\tfamily_name\n",
+        );
+        for (unit_idx, unit) in index.units.iter().enumerate() {
+            let node = index.string(unit.hierarchy_node);
+            let thresholds = fam.get(node).cloned().unwrap_or_default();
+            out.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                unit_idx,
+                index.string(unit.id),
+                unit.kind().as_str(),
+                index.string(unit.label),
+                index.optional_string(unit.element_symbol).unwrap_or_default(),
+                index.optional_string(unit.gene_symbol).unwrap_or_default(),
+                index.optional_string(unit.allele_symbol).unwrap_or_default(),
+                index.string(unit.gene_group),
+                node,
+                index.string(unit.type_name),
+                index.string(unit.subtype),
+                index.string(unit.class_name),
+                index.string(unit.subclass),
+                unit.diagnostic_kmers,
+                unit.member_count,
+                unit.weak,
+                thresholds.complete_ident,
+                thresholds.complete_wp_coverage,
+                thresholds.complete_br_coverage,
+                thresholds.partial_ident,
+                thresholds.partial_wp_coverage,
+                thresholds.partial_br_coverage,
+                thresholds.reportable,
+                thresholds.family_name,
+            ));
+        }
+        Ok(out)
+    }
+
+    fn load_fam_thresholds(
+        path: &Path,
+    ) -> anyhow::Result<std::collections::HashMap<String, FamThresholds>> {
+        let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        let mut lines = text.lines();
+        let Some(header) = lines.next() else {
+            return Ok(std::collections::HashMap::new());
+        };
+        let columns: std::collections::HashMap<&str, usize> = header
+            .trim_start_matches('#')
+            .split('\t')
+            .enumerate()
+            .map(|(idx, name)| (name, idx))
+            .collect();
+        let mut by_node = std::collections::HashMap::new();
+        for line in lines {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let fields: Vec<&str> = line.split('\t').collect();
+            let node_id = fam_field(&fields, &columns, "node_id").to_string();
+            if node_id.is_empty() {
+                continue;
+            }
+            by_node.insert(
+                node_id,
+                FamThresholds {
+                    complete_ident: fam_field(&fields, &columns, "blastrule_complete_ident")
+                        .to_string(),
+                    complete_wp_coverage: fam_field(
+                        &fields,
+                        &columns,
+                        "blastrule_complete_wp_coverage",
+                    )
+                    .to_string(),
+                    complete_br_coverage: fam_field(
+                        &fields,
+                        &columns,
+                        "blastrule_complete_br_coverage",
+                    )
+                    .to_string(),
+                    partial_ident: fam_field(&fields, &columns, "blastrule_partial_ident")
+                        .to_string(),
+                    partial_wp_coverage: fam_field(
+                        &fields,
+                        &columns,
+                        "blastrule_partial_wp_coverage",
+                    )
+                    .to_string(),
+                    partial_br_coverage: fam_field(
+                        &fields,
+                        &columns,
+                        "blastrule_partial_br_coverage",
+                    )
+                    .to_string(),
+                    reportable: fam_field(&fields, &columns, "reportable").to_string(),
+                    family_name: fam_field(&fields, &columns, "family_name").to_string(),
+                },
+            );
+        }
+        Ok(by_node)
+    }
+
+    fn fam_field<'a>(
+        fields: &'a [&str],
+        columns: &std::collections::HashMap<&str, usize>,
+        name: &str,
+    ) -> &'a str {
+        columns
+            .get(name)
+            .and_then(|idx| fields.get(*idx))
+            .copied()
+            .unwrap_or("")
     }
 
     fn fetch_db(out_dir: &Path, base_url: &str) -> anyhow::Result<()> {
@@ -589,6 +786,40 @@ mod native {
             db_dir,
             refinement_k,
             missing_kmer_limit,
+        })?;
+        let json = serde_json::to_string_pretty(&report)?;
+        if let Some(out) = out {
+            fs::write(out, json).with_context(|| format!("write {}", out.display()))?;
+        } else {
+            println!("{json}");
+        }
+        Ok(())
+    }
+
+    fn run_truth_kmer_evidence(
+        index_path: &Path,
+        assembly: &Path,
+        amrfinder_tsv: &Path,
+        detector_json: &Path,
+        include_types: &[ReferenceTypeArg],
+        min_gene_fraction: f64,
+        min_family_fraction: f64,
+        out: Option<&Path>,
+    ) -> anyhow::Result<()> {
+        let index = load_index(index_path)?;
+        let include_types: Vec<ReferenceType> = include_types
+            .iter()
+            .copied()
+            .map(ReferenceType::from)
+            .collect();
+        let report = sparrowhawk_amr::truth_kmer_evidence(TruthKmerEvidenceConfig {
+            index: &index,
+            assembly_path: assembly,
+            amrfinder_tsv,
+            detector_json,
+            include_types: &include_types,
+            min_gene_fraction,
+            min_family_fraction,
         })?;
         let json = serde_json::to_string_pretty(&report)?;
         if let Some(out) = out {

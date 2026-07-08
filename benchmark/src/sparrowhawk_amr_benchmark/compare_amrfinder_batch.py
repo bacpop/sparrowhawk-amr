@@ -253,6 +253,70 @@ def report_map_path(report_map_root: Path, mode: str, k: int) -> Path:
     return report_map_root / f"{alphabet}_k{k}.tsv"
 
 
+def unit_stats_path(unit_stats_root: Path, mode: str, k: int) -> Path:
+    alphabet = "protein" if mode == "protein_cds" else "dna"
+    return unit_stats_root / f"{alphabet}_k{k}.tsv"
+
+
+def load_unit_stats_rows(path: Path | None) -> list[dict[str, str]]:
+    if path is None or not path.exists():
+        return []
+    with path.open(newline="") as handle:
+        return list(csv.DictReader(handle, delimiter="\t"))
+
+
+def unit_stats_lookup(rows: list[dict[str, str]]) -> dict[str, dict[str, str]]:
+    lookup: dict[str, dict[str, str]] = {}
+    for row in rows:
+        for key in (row.get("unit_key", ""), row.get("hierarchy_node", ""), row.get("element_symbol", "")):
+            key = canonical_report_node(key)
+            if key:
+                lookup.setdefault(key, row)
+    return lookup
+
+
+def hit_diagnostic_total(hit: dict[str, Any], unit_stats: dict[str, str] | None = None) -> str:
+    value = hit.get("first_pass_diagnostic_total", "")
+    if value not in (None, ""):
+        return str(value)
+    if unit_stats:
+        return unit_stats.get("diagnostic_kmers", "")
+    return ""
+
+
+def hit_diagnostic_matched(hit: dict[str, Any]) -> str:
+    value = hit.get("first_pass_distinct", "")
+    return "" if value is None else str(value)
+
+
+def diagnostic_missing(total: object, matched: object) -> str:
+    try:
+        return str(max(0, int(float(str(total))) - int(float(str(matched)))))
+    except (TypeError, ValueError):
+        return ""
+
+
+def diagnostic_fraction(total: object, matched: object) -> str:
+    try:
+        denominator = float(str(total))
+        numerator = float(str(matched))
+    except (TypeError, ValueError):
+        return ""
+    if denominator <= 0:
+        return "0.0"
+    return f"{numerator / denominator:.6f}"
+
+
+def report_unit_for_native_row(row: dict[str, str], report_map: dict[str, str]) -> str:
+    node = row.get("Hierarchy node", "")
+    if node:
+        return canonical_report_node(node)
+    accession = row.get("Closest reference accession", "")
+    symbol = row.get("Element symbol", "")
+    unit = report_map.get(accession) or report_map.get(symbol)
+    return canonical_report_node(unit or symbol)
+
+
 def normalize_amrfinder(
     rows: list[dict[str, str]],
     report_map: dict[str, str],
@@ -546,6 +610,7 @@ def main() -> None:
     parser.add_argument("--amrfinder-status", type=Path, required=True)
     parser.add_argument("--detector-root", type=Path, required=True)
     parser.add_argument("--report-map-root", type=Path, required=True)
+    parser.add_argument("--unit-stats-root", type=Path)
     parser.add_argument("--hierarchy", type=Path)
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--status-csv", type=Path, action="append", required=True)
@@ -569,6 +634,7 @@ def main() -> None:
 
     report_map_by_key: dict[tuple[str, int], dict[str, str]] = {}
     report_context_by_key: dict[tuple[str, int], dict[str, Any]] = {}
+    unit_stats_by_key: dict[tuple[str, int], dict[str, dict[str, str]]] = {}
     universes_by_key: dict[tuple[str, int], dict[str, set[str]]] = {}
     for params in params_by_status.values():
         key = (str(params["mode"]), int(params["k"]))
@@ -577,6 +643,11 @@ def main() -> None:
         rows = load_report_map_rows(report_map_path(args.report_map_root, key[0], key[1]))
         report_map_by_key[key] = report_map_lookup(rows)
         report_context_by_key[key] = report_map_context(rows, hierarchy, included_types)
+        if args.unit_stats_root:
+            unit_rows = load_unit_stats_rows(unit_stats_path(args.unit_stats_root, key[0], key[1]))
+        else:
+            unit_rows = []
+        unit_stats_by_key[key] = unit_stats_lookup(unit_rows)
         universes_by_key[key] = metric_universes(rows, hierarchy, included_types)
 
     aggregate_rows = []
@@ -585,12 +656,15 @@ def main() -> None:
     subclass_rows = []
     species_class_rows = []
     type_rows = []
+    all_truth_rows = []
+    all_detector_rows = []
 
     for status_csv in status_paths:
         params = params_by_status[status_csv]
         key = (str(params["mode"]), int(params["k"]))
         report_map = report_map_by_key[key]
         report_context = report_context_by_key[key]
+        unit_stats = unit_stats_by_key.get(key, {})
         universes = universes_by_key[key]
         micro: collections.Counter[str] = collections.Counter()
         species_micro: dict[str, collections.Counter[str]] = collections.defaultdict(collections.Counter)
@@ -670,6 +744,81 @@ def main() -> None:
                 report_baseline,
                 report_context,
             )
+            for native_row in native_rows:
+                truth_unit = report_unit_for_native_row(native_row, report_map)
+                covering_detector_units = sorted(
+                    detector
+                    for detector in report_detector
+                    if report_unit_covers(detector, truth_unit, report_context)
+                )
+                stats = unit_stats.get(truth_unit, {})
+                all_truth_rows.append(
+                    {
+                        **params,
+                        "assembly_id": assembly_id,
+                        "species": row.get("species", ""),
+                        "genus": row.get("genus", ""),
+                        "classes": row.get("classes", ""),
+                        "assembly_fasta": row.get("local_fasta_path", ""),
+                        "report_unit": truth_unit,
+                        "covered": bool(covering_detector_units),
+                        "covering_detector_units": ";".join(covering_detector_units),
+                        "is_tp": bool(covering_detector_units),
+                        "is_fn": not bool(covering_detector_units),
+                        "element_symbol": native_row.get("Element symbol", ""),
+                        "hierarchy_node": native_row.get("Hierarchy node", ""),
+                        "method": native_row.get("Method", ""),
+                        "type_name": native_row.get("Type", ""),
+                        "subtype": native_row.get("Subtype", ""),
+                        "class_name": native_row.get("Class", ""),
+                        "subclass": native_row.get("Subclass", ""),
+                        "diagnostic_total": stats.get("diagnostic_kmers", ""),
+                        "member_genes": stats.get("member_genes", ""),
+                        "unit_type": stats.get("unit_type", ""),
+                        "closest_reference_accession": native_row.get("Closest reference accession", ""),
+                    }
+                )
+
+            for hit in detector_payload.get("hits", []):
+                for detector_unit in detector_report_units_for_matching(hit):
+                    covered_truth_units = sorted(
+                        truth
+                        for truth in report_baseline
+                        if report_unit_covers(detector_unit, truth, report_context)
+                    )
+                    stats = unit_stats.get(detector_unit, {})
+                    total = hit_diagnostic_total(hit, stats)
+                    matched = hit_diagnostic_matched(hit)
+                    all_detector_rows.append(
+                        {
+                            **params,
+                            "assembly_id": assembly_id,
+                            "species": row.get("species", ""),
+                            "genus": row.get("genus", ""),
+                            "classes": row.get("classes", ""),
+                            "assembly_fasta": row.get("local_fasta_path", ""),
+                            "report_unit": detector_unit,
+                            "covered": bool(covered_truth_units),
+                            "covered_truth_units": ";".join(covered_truth_units),
+                            "is_tp": bool(covered_truth_units),
+                            "is_fp": not bool(covered_truth_units),
+                            "call_type": hit.get("call_type", hit.get("unit_type", "")),
+                            "unit_type": hit.get("unit_type", stats.get("unit_type", "")),
+                            "unit_label": hit.get("unit_label", ""),
+                            "query_id": hit.get("query_id", ""),
+                            "call_fraction": hit.get("call_fraction", ""),
+                            "diagnostic_total": total,
+                            "diagnostic_matched": matched,
+                            "diagnostic_missing": diagnostic_missing(total, matched),
+                            "diagnostic_fraction": diagnostic_fraction(total, matched),
+                            "type_name": hit.get("type_name", hit.get("type", "")),
+                            "subtype": hit.get("subtype", ""),
+                            "class_name": hit.get("class_name", ""),
+                            "subclass": hit.get("subclass", ""),
+                            "member_genes": stats.get("member_genes", ""),
+                        }
+                    )
+
             per_assembly.append(
                 {
                     "assembly_id": assembly_id,
@@ -678,6 +827,7 @@ def main() -> None:
                     "classes": row.get("classes", ""),
                     "antibiotics": row.get("antibiotics", ""),
                     **params,
+                    "assembly_fasta": row.get("local_fasta_path", ""),
                     "native_amrfinder_tsv": baseline_row["tsv_path"],
                     "detector_json": str(detector_json_path),
                     "baseline_exact_count": len(exact_baseline),
@@ -736,6 +886,8 @@ def main() -> None:
     write_csv(args.out_dir / "subclass_metrics.csv", list(subclass_rows[0].keys()) if subclass_rows else [], subclass_rows)
     write_csv(args.out_dir / "species_class_metrics.csv", list(species_class_rows[0].keys()) if species_class_rows else [], species_class_rows)
     write_csv(args.out_dir / "type_metrics.csv", list(type_rows[0].keys()) if type_rows else [], type_rows)
+    write_csv(args.out_dir / "all_truth_report_units.csv", list(all_truth_rows[0].keys()) if all_truth_rows else [], all_truth_rows)
+    write_csv(args.out_dir / "all_detector_report_units.csv", list(all_detector_rows[0].keys()) if all_detector_rows else [], all_detector_rows)
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ compute_native_effective_out
 NATIVE_STATUS="$NATIVE_EFFECTIVE_OUT/amrfinder_status.csv"
 HIERARCHY="$DB/ReferenceGeneHierarchy.txt"
 REPORT_MAP_ROOT="$DETECTOR_OUT/report_maps"
+UNIT_STATS_ROOT="$DETECTOR_OUT/unit_stats"
 
 if [[ ! -f "$HIERARCHY" ]]; then
   echo "Missing required AMRFinderPlus hierarchy file: $HIERARCHY" >&2
@@ -49,6 +50,10 @@ uv --directory "$BENCHMARK_DIR" run amr-compare-amrfinder-batch \
   --amrfinder-status "$NATIVE_STATUS" \
   --detector-root "$DETECTOR_OUT" \
   --report-map-root "$REPORT_MAP_ROOT" \
+  --unit-stats-root "$UNIT_STATS_ROOT" \
+  --detector-bin "$DETECTOR_BIN" \
+  --detector-root "$DETECTOR_OUT" \
+  --db-dir "$DB" \
   --hierarchy "$HIERARCHY" \
   --include-types "$INCLUDE_TYPES" \
   --out-dir "$COMPARISON_OUT" \
@@ -64,6 +69,10 @@ echo "Analyzing failures..."
 uv --directory "$BENCHMARK_DIR" run amr-analyze-failures \
   --comparison-dir "$COMPARISON_OUT" \
   --report-map-root "$REPORT_MAP_ROOT" \
+  --unit-stats-root "$UNIT_STATS_ROOT" \
+  --detector-bin "$DETECTOR_BIN" \
+  --detector-root "$DETECTOR_OUT" \
+  --db-dir "$DB" \
   --hierarchy "$HIERARCHY" \
   --include-types "$INCLUDE_TYPES" \
   --out-dir "$FAILURE_OUT"
@@ -85,6 +94,10 @@ for index in "$DETECTOR_OUT"/indexes/*.amridx; do
   "$DETECTOR_BIN" index stats \
     --index "$index" \
     > "$RUN/index_stats_${name}.txt"
+  "$DETECTOR_BIN" index unit-stats \
+    --index "$index" \
+    --db-dir "$DB" \
+    --out "$RUN/index_unit_stats_${name}.tsv"
   du -h "$index" > "$RUN/index_size_${name}.txt"
 done
 

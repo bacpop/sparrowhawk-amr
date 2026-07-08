@@ -1,7 +1,7 @@
 use crate::amrfinder_db::{ReferenceType, load_amrfinder_references};
 use crate::detect::DetectionResult;
 use crate::fasta::read_fasta;
-use crate::index::{AmrIndex, IndexAlphabet, ReportUnitKind};
+use crate::index::{AmrIndex, IndexAlphabet, ReportUnitKind, UnitId};
 use crate::kmer::{DnaKmerIter, SplitKmerIter, decode_kmer};
 use anyhow::{Context, ensure};
 use serde::Serialize;
@@ -20,6 +20,64 @@ pub struct DebugMissesConfig<'a> {
     pub db_dir: Option<&'a Path>,
     pub refinement_k: usize,
     pub missing_kmer_limit: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct TruthKmerEvidenceConfig<'a> {
+    pub index: &'a AmrIndex,
+    pub assembly_path: &'a Path,
+    pub amrfinder_tsv: &'a Path,
+    pub detector_json: &'a Path,
+    pub include_types: &'a [ReferenceType],
+    pub min_gene_fraction: f64,
+    pub min_family_fraction: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TruthKmerEvidenceReport {
+    pub assembly: String,
+    pub detector_json: String,
+    pub amrfinder_tsv: String,
+    pub index_k: usize,
+    pub truth_count: usize,
+    pub rows: Vec<TruthKmerEvidenceRow>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TruthKmerEvidenceRow {
+    pub element_symbol: String,
+    pub hierarchy_node: String,
+    pub method: String,
+    pub type_name: String,
+    pub subtype: String,
+    pub class_name: String,
+    pub subclass: String,
+    pub contig_id: String,
+    pub start: usize,
+    pub stop: usize,
+    pub strand: String,
+    pub coverage_of_reference: Option<f64>,
+    pub identity_to_reference: Option<f64>,
+    pub closest_reference_accession: String,
+    pub covered_by_detector: bool,
+    pub covering_detector_units: Vec<String>,
+    pub truth_supported_by_index: bool,
+    pub best_index_unit: Option<String>,
+    pub best_index_unit_type: Option<String>,
+    pub best_index_unit_label: Option<String>,
+    pub best_diagnostic_total: usize,
+    pub best_diagnostic_matched: usize,
+    pub best_diagnostic_missing: usize,
+    pub best_diagnostic_fraction: f64,
+    pub exact_diagnostic_total: usize,
+    pub exact_diagnostic_matched: usize,
+    pub exact_diagnostic_fraction: f64,
+    pub family_diagnostic_total: usize,
+    pub family_diagnostic_matched: usize,
+    pub family_diagnostic_fraction: f64,
+    pub interval_length: usize,
+    pub interval_distinct_kmers: usize,
+    pub recall_failure_category: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -86,6 +144,10 @@ struct AmrfinderRow {
     element_symbol: String,
     hierarchy_node: String,
     method: String,
+    type_name: String,
+    subtype: String,
+    class_name: String,
+    subclass: String,
     contig_id: String,
     start: usize,
     stop: usize,
@@ -95,6 +157,58 @@ struct AmrfinderRow {
     coverage_of_reference: Option<f64>,
     identity_to_reference: Option<f64>,
     closest_reference_accession: String,
+}
+
+pub fn truth_kmer_evidence(
+    config: TruthKmerEvidenceConfig<'_>,
+) -> anyhow::Result<TruthKmerEvidenceReport> {
+    ensure!(
+        config.index.alphabet == IndexAlphabet::Dna,
+        "AMRFinder truth k-mer evidence only supports DNA indexes"
+    );
+
+    let assembly = read_fasta(config.assembly_path)?;
+    let contigs: HashMap<String, Vec<u8>> = assembly
+        .into_iter()
+        .map(|record| (record.id, record.seq))
+        .collect();
+    let include_types: HashSet<&str> = config
+        .include_types
+        .iter()
+        .map(|value| value.as_str())
+        .collect();
+    let amrfinder_rows = parse_amrfinder_rows_with_types(config.amrfinder_tsv, &include_types)?;
+    let detector = parse_detector_json(config.detector_json)?;
+    let detector_units = detector_report_units(&detector);
+    let gene_by_accession: HashMap<&str, usize> = config
+        .index
+        .genes
+        .iter()
+        .enumerate()
+        .map(|(idx, gene)| (config.index.string(gene.protein_accession), idx))
+        .collect();
+
+    let mut rows = Vec::new();
+    for row in &amrfinder_rows {
+        rows.push(truth_evidence_row(
+            row,
+            config.index,
+            &gene_by_accession,
+            &contigs,
+            &detector_units,
+            config.min_gene_fraction,
+            config.min_family_fraction,
+        )?);
+    }
+
+    Ok(TruthKmerEvidenceReport {
+        assembly: config.assembly_path.display().to_string(),
+        detector_json: config.detector_json.display().to_string(),
+        amrfinder_tsv: config.amrfinder_tsv.display().to_string(),
+        index_k: config.index.k,
+        truth_count: rows.len(),
+        rows,
+    })
 }
 
 pub fn debug_amrfinder_misses(config: DebugMissesConfig<'_>) -> anyhow::Result<DebugMissesReport> {
@@ -315,6 +429,17 @@ fn detector_gene_symbols(result: &DetectionResult) -> HashSet<String> {
 }
 
 fn parse_amrfinder_rows(path: &Path) -> anyhow::Result<Vec<AmrfinderRow>> {
+    let include_types = HashSet::from(["AMR"]);
+    Ok(parse_amrfinder_rows_with_types(path, &include_types)?
+        .into_iter()
+        .filter(|row| row.subtype == "AMR")
+        .collect())
+}
+
+fn parse_amrfinder_rows_with_types(
+    path: &Path,
+    include_types: &HashSet<&str>,
+) -> anyhow::Result<Vec<AmrfinderRow>> {
     let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let mut lines = text.lines();
     let header = lines.next().context("AMRFinderPlus TSV is empty")?;
@@ -330,14 +455,17 @@ fn parse_amrfinder_rows(path: &Path) -> anyhow::Result<Vec<AmrfinderRow>> {
         }
         let fields: Vec<&str> = line.split('\t').collect();
         let type_value = tsv_field(&fields, &columns, "Type");
-        let subtype_value = tsv_field(&fields, &columns, "Subtype");
-        if type_value != "AMR" || subtype_value != "AMR" {
+        if !include_types.contains(type_value) {
             continue;
         }
         rows.push(AmrfinderRow {
             element_symbol: tsv_field(&fields, &columns, "Element symbol").to_string(),
             hierarchy_node: tsv_field(&fields, &columns, "Hierarchy node").to_string(),
             method: tsv_field(&fields, &columns, "Method").to_string(),
+            type_name: type_value.to_string(),
+            subtype: tsv_field(&fields, &columns, "Subtype").to_string(),
+            class_name: tsv_field(&fields, &columns, "Class").to_string(),
+            subclass: tsv_field(&fields, &columns, "Subclass").to_string(),
             contig_id: tsv_field(&fields, &columns, "Contig id").to_string(),
             start: parse_usize(tsv_field(&fields, &columns, "Start")),
             stop: parse_usize(tsv_field(&fields, &columns, "Stop")),
@@ -396,6 +524,332 @@ fn parse_optional_f64(value: &str) -> Option<f64> {
     } else {
         value.parse().ok()
     }
+}
+
+#[derive(Debug, Clone)]
+struct UnitEvidence {
+    unit_id: usize,
+    total: usize,
+    matched: usize,
+    fraction: f64,
+}
+
+fn truth_evidence_row(
+    row: &AmrfinderRow,
+    index: &AmrIndex,
+    gene_by_accession: &HashMap<&str, usize>,
+    contigs: &HashMap<String, Vec<u8>>,
+    detector_units: &HashSet<String>,
+    min_gene_fraction: f64,
+    min_family_fraction: f64,
+) -> anyhow::Result<TruthKmerEvidenceRow> {
+    let interval = match extract_interval(contigs, row) {
+        Ok(interval) => interval,
+        Err(_) => {
+            return Ok(empty_truth_evidence_row(
+                row,
+                detector_units,
+                "interval_unusable",
+            ));
+        }
+    };
+    let interval_kmers = distinct_kmers(&interval, index.k);
+    let gene_id = gene_by_accession
+        .get(row.closest_reference_accession.as_str())
+        .copied();
+    let mut candidates = Vec::<UnitEvidence>::new();
+    let mut exact = UnitEvidence::empty();
+    let mut family = UnitEvidence::empty();
+
+    if let Some(gene_id) = gene_id {
+        let gene = &index.genes[gene_id];
+        exact = unit_evidence(index, gene.report_unit_id as usize, &interval_kmers);
+        candidates.push(exact.clone());
+
+        for unit_id in candidate_unit_ids_for_gene(
+            index,
+            gene.report_unit_id,
+            index.string(gene.hierarchy_node),
+        ) {
+            let evidence = unit_evidence(index, unit_id as usize, &interval_kmers);
+            if index.units[unit_id as usize].kind() == ReportUnitKind::HierarchyNode
+                && index.string(index.units[unit_id as usize].hierarchy_node)
+                    == index.string(gene.hierarchy_node)
+            {
+                family = evidence.clone();
+            }
+            candidates.push(evidence);
+        }
+    } else if !row.hierarchy_node.is_empty() {
+        for (unit_id, unit) in index.units.iter().enumerate() {
+            if unit.kind() == ReportUnitKind::HierarchyNode
+                && index.string(unit.hierarchy_node) == row.hierarchy_node
+            {
+                let evidence = unit_evidence(index, unit_id, &interval_kmers);
+                family = evidence.clone();
+                candidates.push(evidence);
+            }
+        }
+    }
+
+    candidates.sort_by(|left, right| {
+        right
+            .fraction
+            .partial_cmp(&left.fraction)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| right.matched.cmp(&left.matched))
+    });
+    candidates.dedup_by_key(|evidence| evidence.unit_id);
+    let best = candidates
+        .first()
+        .cloned()
+        .unwrap_or_else(UnitEvidence::empty);
+    let supported = gene_id.is_some() || !candidates.is_empty();
+    let covering_detector_units = detector_units_for_truth(row, detector_units, index);
+    let covered_by_detector = !covering_detector_units.is_empty();
+    let category = recall_failure_category(
+        supported,
+        interval.is_empty() || interval_kmers.is_empty(),
+        covered_by_detector,
+        &best,
+        min_gene_fraction.min(min_family_fraction),
+    );
+
+    Ok(TruthKmerEvidenceRow {
+        element_symbol: row.element_symbol.clone(),
+        hierarchy_node: row.hierarchy_node.clone(),
+        method: row.method.clone(),
+        type_name: row.type_name.clone(),
+        subtype: row.subtype.clone(),
+        class_name: row.class_name.clone(),
+        subclass: row.subclass.clone(),
+        contig_id: row.contig_id.clone(),
+        start: row.start,
+        stop: row.stop,
+        strand: row.strand.clone(),
+        coverage_of_reference: row.coverage_of_reference,
+        identity_to_reference: row.identity_to_reference,
+        closest_reference_accession: row.closest_reference_accession.clone(),
+        covered_by_detector,
+        covering_detector_units,
+        truth_supported_by_index: supported,
+        best_index_unit: best.unit_key(index),
+        best_index_unit_type: best.unit_type(index),
+        best_index_unit_label: best.unit_label(index),
+        best_diagnostic_total: best.total,
+        best_diagnostic_matched: best.matched,
+        best_diagnostic_missing: best.total.saturating_sub(best.matched),
+        best_diagnostic_fraction: best.fraction,
+        exact_diagnostic_total: exact.total,
+        exact_diagnostic_matched: exact.matched,
+        exact_diagnostic_fraction: exact.fraction,
+        family_diagnostic_total: family.total,
+        family_diagnostic_matched: family.matched,
+        family_diagnostic_fraction: family.fraction,
+        interval_length: interval.len(),
+        interval_distinct_kmers: interval_kmers.len(),
+        recall_failure_category: category.to_string(),
+    })
+}
+
+fn empty_truth_evidence_row(
+    row: &AmrfinderRow,
+    detector_units: &HashSet<String>,
+    category: &str,
+) -> TruthKmerEvidenceRow {
+    let covering_detector_units = detector_units_for_truth_without_index(row, detector_units);
+    TruthKmerEvidenceRow {
+        element_symbol: row.element_symbol.clone(),
+        hierarchy_node: row.hierarchy_node.clone(),
+        method: row.method.clone(),
+        type_name: row.type_name.clone(),
+        subtype: row.subtype.clone(),
+        class_name: row.class_name.clone(),
+        subclass: row.subclass.clone(),
+        contig_id: row.contig_id.clone(),
+        start: row.start,
+        stop: row.stop,
+        strand: row.strand.clone(),
+        coverage_of_reference: row.coverage_of_reference,
+        identity_to_reference: row.identity_to_reference,
+        closest_reference_accession: row.closest_reference_accession.clone(),
+        covered_by_detector: !covering_detector_units.is_empty(),
+        covering_detector_units,
+        truth_supported_by_index: false,
+        best_index_unit: None,
+        best_index_unit_type: None,
+        best_index_unit_label: None,
+        best_diagnostic_total: 0,
+        best_diagnostic_matched: 0,
+        best_diagnostic_missing: 0,
+        best_diagnostic_fraction: 0.0,
+        exact_diagnostic_total: 0,
+        exact_diagnostic_matched: 0,
+        exact_diagnostic_fraction: 0.0,
+        family_diagnostic_total: 0,
+        family_diagnostic_matched: 0,
+        family_diagnostic_fraction: 0.0,
+        interval_length: 0,
+        interval_distinct_kmers: 0,
+        recall_failure_category: category.to_string(),
+    }
+}
+
+impl UnitEvidence {
+    fn empty() -> Self {
+        Self {
+            unit_id: usize::MAX,
+            total: 0,
+            matched: 0,
+            fraction: 0.0,
+        }
+    }
+
+    fn unit_key(&self, index: &AmrIndex) -> Option<String> {
+        index
+            .units
+            .get(self.unit_id)
+            .map(|unit| index.string(unit.id).to_string())
+    }
+
+    fn unit_type(&self, index: &AmrIndex) -> Option<String> {
+        index
+            .units
+            .get(self.unit_id)
+            .map(|unit| unit.kind().as_str().to_string())
+    }
+
+    fn unit_label(&self, index: &AmrIndex) -> Option<String> {
+        index
+            .units
+            .get(self.unit_id)
+            .map(|unit| index.string(unit.label).to_string())
+    }
+}
+
+fn unit_evidence(index: &AmrIndex, unit_id: usize, interval_kmers: &HashSet<u64>) -> UnitEvidence {
+    let diagnostic = index.unit_specific_kmers(unit_id);
+    let matched = diagnostic.intersection(interval_kmers).count();
+    UnitEvidence {
+        unit_id,
+        total: diagnostic.len(),
+        matched,
+        fraction: fraction(matched, diagnostic.len()),
+    }
+}
+
+fn candidate_unit_ids_for_gene(
+    index: &AmrIndex,
+    report_unit_id: UnitId,
+    hierarchy_node: &str,
+) -> Vec<UnitId> {
+    let mut ids = Vec::new();
+    ids.push(report_unit_id);
+    if let Some(unit) = index.units.get(report_unit_id as usize) {
+        ids.extend(unit.ancestor_unit_ids.iter().copied());
+    }
+    ids.extend(index.units.iter().enumerate().filter_map(|(idx, unit)| {
+        (unit.kind() == ReportUnitKind::HierarchyNode
+            && index.string(unit.hierarchy_node) == hierarchy_node)
+            .then_some(idx as UnitId)
+    }));
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+fn detector_report_units(result: &DetectionResult) -> HashSet<String> {
+    result.hits.iter().map(detector_report_unit).collect()
+}
+
+fn detector_report_unit(hit: &crate::detect::DetectionHit) -> String {
+    if hit.call_type == "gene_group" {
+        hit.unit_id.clone()
+    } else {
+        hit.hierarchy_node
+            .clone()
+            .or_else(|| (!hit.gene_group.is_empty()).then_some(hit.gene_group.clone()))
+            .or_else(|| hit.element_symbol.clone())
+            .unwrap_or_else(|| hit.unit_id.clone())
+    }
+}
+
+fn detector_units_for_truth(
+    row: &AmrfinderRow,
+    detector_units: &HashSet<String>,
+    index: &AmrIndex,
+) -> Vec<String> {
+    let mut units: Vec<String> = detector_units
+        .iter()
+        .filter(|unit| detector_unit_covers_truth(unit, row, index))
+        .cloned()
+        .collect();
+    units.sort();
+    units
+}
+
+fn detector_units_for_truth_without_index(
+    row: &AmrfinderRow,
+    detector_units: &HashSet<String>,
+) -> Vec<String> {
+    let mut units: Vec<String> = detector_units
+        .iter()
+        .filter(|unit| *unit == &row.hierarchy_node || *unit == &row.element_symbol)
+        .cloned()
+        .collect();
+    units.sort();
+    units
+}
+
+fn detector_unit_covers_truth(unit: &str, row: &AmrfinderRow, index: &AmrIndex) -> bool {
+    if unit == row.hierarchy_node || unit == row.element_symbol {
+        return true;
+    }
+    let Some(detector_unit) = index
+        .units
+        .iter()
+        .find(|candidate| index.string(candidate.id) == unit)
+    else {
+        return false;
+    };
+    if detector_unit.kind() != ReportUnitKind::HierarchyNode {
+        return false;
+    }
+    index.units.iter().any(|truth_unit| {
+        index.string(truth_unit.hierarchy_node) == row.hierarchy_node
+            && truth_unit
+                .ancestor_unit_ids
+                .iter()
+                .any(|&ancestor_id| index.string(index.units[ancestor_id as usize].id) == unit)
+    })
+}
+
+fn recall_failure_category(
+    supported: bool,
+    interval_unusable: bool,
+    covered_by_detector: bool,
+    best: &UnitEvidence,
+    threshold: f64,
+) -> &'static str {
+    if covered_by_detector {
+        return "covered_by_detector";
+    }
+    if !supported {
+        return "unsupported_truth";
+    }
+    if interval_unusable {
+        return "interval_unusable";
+    }
+    if best.matched == 0 {
+        return "no_kmer_evidence";
+    }
+    if best.fraction >= threshold {
+        return "covered_by_kmers_not_reported";
+    }
+    if best.fraction >= threshold * 0.5 {
+        return "near_threshold";
+    }
+    "weak_kmer_evidence"
 }
 
 fn extract_interval(

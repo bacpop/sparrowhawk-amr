@@ -14,7 +14,10 @@ pub use amrfinder_db::{
     load_amrfinder_references,
 };
 #[cfg(not(target_family = "wasm"))]
-pub use debug::{DebugMissesConfig, DebugMissesReport, debug_amrfinder_misses};
+pub use debug::{
+    DebugMissesConfig, DebugMissesReport, TruthKmerEvidenceConfig, TruthKmerEvidenceReport,
+    debug_amrfinder_misses, truth_kmer_evidence,
+};
 pub use detect::{
     DetectParams, DetectionResult, QueryKind, RefinementMode, detect_fasta, detect_protein_fasta,
 };
@@ -71,7 +74,7 @@ impl AmrDetector {
         min_gene_fraction: f64,
         min_gene_group_fraction: f64,
     ) -> Result<String, JsValue> {
-        validate_fraction("min_gene_fraction", min_gene_fraction)?;             // Probably not needed...
+        validate_fraction("min_gene_fraction", min_gene_fraction)?; // Probably not needed...
         validate_fraction("min_gene_group_fraction", min_gene_group_fraction)?; // Probably not needed...
         let params = DetectParams {
             min_gene_fraction,
@@ -96,7 +99,7 @@ impl AmrDetector {
         min_gene_fraction: f64,
         min_gene_group_fraction: f64,
     ) -> Result<String, JsValue> {
-        validate_fraction("min_gene_fraction", min_gene_fraction)?;             // Probably not needed...
+        validate_fraction("min_gene_fraction", min_gene_fraction)?; // Probably not needed...
         validate_fraction("min_gene_group_fraction", min_gene_group_fraction)?; // Probably not needed...
         let params = DetectParams {
             min_gene_fraction,
