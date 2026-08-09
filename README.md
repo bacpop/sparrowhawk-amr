@@ -26,7 +26,7 @@ sparrowhawk-amr detects AMR (as well as stress and virulence) genes in assembled
 
 Current **main features**:
 - Fetching of the AMRFinderPlus reference database from the NCBI FTP (`db fetch`).
-- Construction of a compact, binary k-mer index from it (`index build`), with a DNA or protein alphabet (k=31 by default), and a selectable subset of reference types (AMR, stress, and/or virulence), as well as index inspection commands (`index stats`, `index report-map`, `index unit-stats`).
+- Construction of a compact, binary k-mer index from it (`index build`), with a DNA or protein alphabet (k=31 by default), and a selectable subset of reference types (AMR, stress, and/or virulence), as well as index inspection commands (`index stats`, `index report-map`, `index unit-stats`). The index is small enough to be "easily" shipped on a website (~20 MB).
 - Detection over the contigs directly (`detect direct`), or over genes called from them (`detect cds`) with [orphos](https://github.com/vrbouza/orphos) (which can also be run standalone with `genes call`), including protein-level detection. Results are reported as JSON. Note that no point-mutations are supported currently.
 - Evaluation and debugging tooling against native AMRFinderPlus runs (`eval` subcommands), plus a Python-based benchmark suite in [`benchmark`](./benchmark) (see its own README).
 - Compilation both to native and WebAssembly targets: the wasm build exposes an `AmrDetector` interface to load an index and detect from the browser.
