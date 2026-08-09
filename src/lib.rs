@@ -18,9 +18,7 @@ pub use debug::{
     DebugMissesConfig, DebugMissesReport, TruthKmerEvidenceConfig, TruthKmerEvidenceReport,
     debug_amrfinder_misses, truth_kmer_evidence,
 };
-pub use detect::{
-    DetectParams, DetectionResult, QueryKind, RefinementMode, detect_fasta, detect_protein_fasta,
-};
+pub use detect::{DetectParams, DetectionResult, QueryKind, detect_fasta, detect_protein_fasta};
 #[cfg(not(target_family = "wasm"))]
 pub use gene_callers::{GeneCaller, GeneCallerConfig, run_gene_caller};
 pub use index::{

@@ -1,7 +1,7 @@
 use crate::fasta::{FastaRecord, read_fasta};
 use crate::translate::{DEFAULT_BACTERIAL_TRANSLATION_TABLE, translate_cds};
 use anyhow::{Context, anyhow, ensure};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -258,8 +258,11 @@ fn load_amrfinder_references_from_fasta(
     })?;
 
     let mut references = Vec::new();
+    let mut fusion_groups: BTreeMap<String, Vec<(usize, AmrReference)>> = BTreeMap::new();
     for record in records {
         let header = parse_reference_header(&record, source)?;
+        let fusion_part = header.fusion_part;
+        let total_fusion_parts = header.total_fusion_parts;
         let Some(catalog) = catalog_entries.get(&header.protein_accession) else {
             if source == FastaSource::Protein && header.mechanism == "mutation" {
                 continue;
@@ -307,7 +310,7 @@ fn load_amrfinder_references_from_fasta(
             catalog.gene_family.clone()
         };
         let allele_symbol = catalog.allele_symbol.clone();
-        references.push(AmrReference {
+        let reference = AmrReference {
             protein_accession: header.protein_accession,
             nucleotide_accession: header.nucleotide_accession,
             element_symbol: fallback_element_symbol(
@@ -334,7 +337,27 @@ fn load_amrfinder_references_from_fasta(
             hierarchy_path: ref_hierarchy_path,
             db_version: version.clone(),
             seq: record.seq,
-        });
+        };
+        if total_fusion_parts > 1 {
+            fusion_groups
+                .entry(reference.protein_accession.clone())
+                .or_default()
+                .push((fusion_part, reference));
+        } else {
+            references.push(reference);
+        }
+    }
+
+    for (accession, mut parts) in fusion_groups {
+        parts.sort_by_key(|(part, _)| *part);
+        let identical_seqs = parts.windows(2).all(|pair| pair[0].1.seq == pair[1].1.seq);
+        if !identical_seqs {
+            // A future DB could ship genuinely part-sliced sequences; those stay separate genes.
+            references.extend(parts.into_iter().map(|(_, reference)| reference));
+            continue;
+        }
+        let catalog = catalog_entries.get(&accession);
+        references.push(merge_fusion_parts(parts, catalog)?);
     }
 
     anyhow::ensure!(
@@ -343,6 +366,118 @@ fn load_amrfinder_references_from_fasta(
         fasta_path.display()
     );
     Ok(references)
+}
+
+/// AMRFinderPlus ships a fusion gene as one FASTA record per fused part, each tagged
+/// `fusion_part|total_fusion_parts` in the header but carrying the full-length sequence.
+/// Collapse identical-sequence parts into a single reference: kept separate, the twins make
+/// every k-mer ambiguous and the fusion can never be reported.
+fn merge_fusion_parts(
+    parts: Vec<(usize, AmrReference)>,
+    catalog: Option<&CatalogEntry>,
+) -> anyhow::Result<AmrReference> {
+    ensure!(!parts.is_empty(), "empty fusion part group");
+    let parts: Vec<AmrReference> = parts.into_iter().map(|(_, reference)| reference).collect();
+    if parts.len() == 1 {
+        return Ok(parts.into_iter().next().expect("single fusion part"));
+    }
+
+    let element_symbol = join_distinct(parts.iter().map(|part| part.element_symbol.as_str()));
+    let joined_gene_symbol = join_distinct(parts.iter().map(|part| part.gene_symbol.as_str()));
+    let hierarchy_path = merge_fusion_paths(&parts);
+    let reportable = parts.iter().map(|part| part.reportable).max().unwrap_or(0);
+    let first = &parts[0];
+
+    let catalog_or = |value: Option<&str>, fallback: &str| -> String {
+        match value {
+            Some(text) if !text.is_empty() => text.to_string(),
+            _ => fallback.to_string(),
+        }
+    };
+
+    Ok(AmrReference {
+        protein_accession: first.protein_accession.clone(),
+        nucleotide_accession: first.nucleotide_accession.clone(),
+        element_symbol,
+        gene_symbol: catalog_or(
+            catalog.map(|entry| entry.gene_family.as_str()),
+            &joined_gene_symbol,
+        ),
+        allele_symbol: catalog
+            .map(|entry| entry.allele_symbol.clone())
+            .unwrap_or_default(),
+        product: first.product.clone(),
+        family: catalog_or(
+            catalog.map(|entry| entry.gene_family.as_str()),
+            &first.family,
+        ),
+        class_name: catalog_or(
+            catalog.map(|entry| entry.class_name.as_str()),
+            &first.class_name,
+        ),
+        subclass: catalog_or(
+            catalog.map(|entry| entry.subclass.as_str()),
+            &first.subclass,
+        ),
+        hierarchy_node: catalog_or(
+            catalog.map(|entry| entry.hierarchy_node.as_str()),
+            &first.hierarchy_node,
+        ),
+        scope: first.scope.clone(),
+        type_name: catalog_or(
+            catalog.map(|entry| entry.type_name.as_str()),
+            &first.type_name,
+        ),
+        subtype: catalog_or(catalog.map(|entry| entry.subtype.as_str()), &first.subtype),
+        reportable,
+        hierarchy_path,
+        db_version: first.db_version.clone(),
+        seq: first.seq.clone(),
+    })
+}
+
+fn join_distinct<'a>(values: impl Iterator<Item = &'a str>) -> String {
+    let mut joined: Vec<&str> = Vec::new();
+    for value in values {
+        if !value.is_empty() && !joined.contains(&value) {
+            joined.push(value);
+        }
+    }
+    joined.join("/")
+}
+
+/// Merged fusion path: each part's own nodes (leaf-first, per part order), then the ancestors
+/// shared by every part, once, in the first part's order. Keeping leaf-first ordering lets
+/// k-mers shared with either family's relatives resolve to that family's hierarchy units.
+fn merge_fusion_paths(parts: &[AmrReference]) -> Vec<HierarchyNode> {
+    let shared: Vec<HierarchyNode> = parts[0]
+        .hierarchy_path
+        .iter()
+        .filter(|node| {
+            parts[1..].iter().all(|part| {
+                part.hierarchy_path
+                    .iter()
+                    .any(|other| other.node_id == node.node_id)
+            })
+        })
+        .cloned()
+        .collect();
+    let shared_ids: HashSet<&str> = shared.iter().map(|node| node.node_id.as_str()).collect();
+
+    let mut merged = Vec::new();
+    let mut seen = HashSet::new();
+    for part in parts {
+        for node in &part.hierarchy_path {
+            if shared_ids.contains(node.node_id.as_str()) {
+                continue;
+            }
+            if seen.insert(node.node_id.clone()) {
+                merged.push(node.clone());
+            }
+        }
+    }
+    merged.extend(shared);
+    merged
 }
 
 // Helper/other functions that serve to parse essentially, solve some issues that can happen, etc.
@@ -1243,6 +1378,138 @@ mod tests {
         catalog.hierarchy_node = "aac(6')-Ie,aph(2'')-Ia".to_string();
         let resolved = resolve_effective_node(&header, &catalog, &node_metadata).unwrap();
         assert_eq!(resolved, "aac(6')-Ie");
+    }
+
+    fn scratch_db_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sparrowhawk_amr_dbtest_{}_{}",
+            std::process::id(),
+            tag
+        ));
+        if dir.exists() {
+            fs::remove_dir_all(&dir).unwrap();
+        }
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Minimal on-disk DB with one two-part fusion gene (WP_F) and one ordinary
+    /// relative (WP_R): partA -> famA -> ROOTX and partB -> famB -> ROOTX.
+    fn write_fusion_test_db(dir: &Path, part1_seq: &str, part2_seq: &str) {
+        fs::write(dir.join("version.txt"), "testdb\n").unwrap();
+        fs::write(
+            dir.join("ReferenceGeneHierarchy.txt"),
+            "node_id\tparent_node_id\tsymbol\tclass\tsubclass\tscope\ttype\tsubtype\n\
+             partA\tfamA\tpartA\tCLASSA\tSUBA\tcore\tAMR\tAMR\n\
+             famA\tROOTX\tfamA\tCLASSA\tSUBA\tcore\tAMR\tAMR\n\
+             partB\tfamB\tpartB\tCLASSB\tSUBB\tcore\tAMR\tAMR\n\
+             famB\tROOTX\tfamB\tCLASSB\tSUBB\tcore\tAMR\tAMR\n\
+             ROOTX\t\tROOTX\tCLASSR\tSUBR\tcore\tAMR\tAMR\n\
+             relA\tfamA\trelA\tCLASSA\tSUBA\tcore\tAMR\tAMR\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("ReferenceGeneCatalog.txt"),
+            "allele\tgene_family\tproduct_name\tscope\ttype\tsubtype\tclass\tsubclass\trefseq_protein_accession\trefseq_nucleotide_accession\tgenbank_protein_accession\tgenbank_nucleotide_accession\thierarchy_node\n\
+             \tpartA/partB\tfusion product\tcore\tAMR\tAMR\tCLASSA\tSUBA\tWP_F\tNG_F\t\t\tpartA,partB\n\
+             relA-1\trelA\trel product\tcore\tAMR\tAMR\tCLASSA\tSUBA\tWP_R\tNG_R\t\t\trelA\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("AMR_CDS.fa"),
+            format!(
+                ">WP_F|NG_F|1|2|partA|partA|fusion_product\n{part1_seq}\n\
+                 >WP_F|NG_F|2|2|partB|partB|fusion_product\n{part2_seq}\n\
+                 >WP_R|NG_R|1|1|relA|relA|rel_product\nTTGGCCAATTGGCCAATTGGAACCAAGGTT\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    const FUSION_SEQ: &str = "ACGTACGTAAATTTCCCGGGATATATCCCC";
+
+    #[test]
+    fn merges_identical_fusion_records_into_one_reference() {
+        let dir = scratch_db_dir("fusion_merge");
+        write_fusion_test_db(&dir, FUSION_SEQ, FUSION_SEQ);
+        let references = load_amrfinder_references(&dir, &[ReferenceType::Amr]).unwrap();
+        fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(references.len(), 2);
+        let fusion = references
+            .iter()
+            .find(|reference| reference.protein_accession == "WP_F")
+            .unwrap();
+        assert_eq!(fusion.element_symbol, "partA/partB");
+        assert_eq!(fusion.gene_symbol, "partA/partB");
+        assert_eq!(fusion.hierarchy_node, "partA,partB");
+        assert_eq!(fusion.class_name, "CLASSA");
+        assert_eq!(fusion.subclass, "SUBA");
+        assert_eq!(fusion.seq, FUSION_SEQ.as_bytes());
+        let path_ids: Vec<&str> = fusion
+            .hierarchy_path
+            .iter()
+            .map(|node| node.node_id.as_str())
+            .collect();
+        assert_eq!(path_ids, ["partA", "famA", "partB", "famB", "ROOTX"]);
+    }
+
+    #[test]
+    fn keeps_fusion_parts_with_distinct_sequences() {
+        let dir = scratch_db_dir("fusion_distinct");
+        write_fusion_test_db(&dir, FUSION_SEQ, "GGGGGAAAAACCCCCTTTTTGGGGGAAAAA");
+        let references = load_amrfinder_references(&dir, &[ReferenceType::Amr]).unwrap();
+        fs::remove_dir_all(&dir).ok();
+
+        let fusion_parts = references
+            .iter()
+            .filter(|reference| reference.protein_accession == "WP_F")
+            .count();
+        assert_eq!(fusion_parts, 2);
+        assert_eq!(references.len(), 3);
+    }
+
+    #[test]
+    fn merged_fusion_is_detectable() {
+        use crate::detect::{DetectParams, QueryKind, detect_fasta};
+        use crate::index::{IndexAlphabet, IndexBuildConfig, build_index};
+
+        let dir = scratch_db_dir("fusion_detect");
+        write_fusion_test_db(&dir, FUSION_SEQ, FUSION_SEQ);
+        let references = load_amrfinder_references(&dir, &[ReferenceType::Amr]).unwrap();
+        fs::remove_dir_all(&dir).ok();
+
+        let index = build_index(
+            &references,
+            &IndexBuildConfig {
+                alphabet: IndexAlphabet::Dna,
+                k: 5,
+                min_exact_gene_kmers: 0,
+                min_hierarchy_unit_kmers: 1,
+            },
+        )
+        .unwrap();
+        let fasta = format!(">contig\n{FUSION_SEQ}\n");
+        let result = detect_fasta(
+            &index,
+            fasta.as_bytes(),
+            "sample",
+            QueryKind::Direct,
+            &DetectParams {
+                min_gene_fraction: 0.5,
+                ..DetectParams::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            result
+                .hits
+                .iter()
+                .any(|hit| hit.element_symbol.as_deref() == Some("partA/partB")
+                    && hit.call_type == "gene"),
+            "fusion gene was not reported: {:?}",
+            result.hits
+        );
     }
 
     #[test]

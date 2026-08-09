@@ -12,34 +12,11 @@ pub enum QueryKind {
     ProteinCds,
 }
 
-/// TEST This temporary enum was done for doing tests and seeing if getting lower k-vals
-/// after first matches, or using split k-mers might help refine the results
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum RefinementMode {
-    None,
-    Split,
-    LowK,
-}
-
-impl std::fmt::Display for RefinementMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::None => write!(f, "none"),
-            Self::Split => write!(f, "split"),
-            Self::LowK => write!(f, "lowk"),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectParams {
     pub min_gene_fraction: f64,
     #[serde(alias = "min_gene_group_fraction")]
     pub min_gene_group_fraction: f64,
-    pub seed_gene_fraction: f64,
-    pub seed_gene_hits: usize,
-    pub refinement_mode: RefinementMode,
-    pub refinement_k: usize,
 }
 
 impl Default for DetectParams {
@@ -47,10 +24,6 @@ impl Default for DetectParams {
         Self {
             min_gene_fraction: 0.10,
             min_gene_group_fraction: 0.10,
-            seed_gene_fraction: 0.01,
-            seed_gene_hits: 3,
-            refinement_mode: RefinementMode::None,
-            refinement_k: 21,
         }
     }
 }
@@ -80,10 +53,6 @@ pub struct DetectionHit {
     pub first_pass_total: usize,
     pub first_pass_diagnostic_total: usize,
     pub first_pass_fraction: f64,
-    pub refinement_distinct: usize,
-    pub refinement_total: usize,
-    pub refinement_diagnostic_total: usize,
-    pub refinement_fraction: f64,
     pub call_fraction: f64,
     pub call_type: String,
 }
@@ -96,8 +65,6 @@ pub struct DetectionResult {
     #[serde(default)]
     pub index_alphabet: IndexAlphabet,
     pub index_k: usize,
-    pub refinement_mode: RefinementMode,
-    pub refinement_k: usize,
     pub hits: Vec<DetectionHit>,
     pub gene_count: usize,
     pub gene_group_count: usize,
@@ -172,11 +139,17 @@ pub fn detect_fasta(
         }
 
         let mut suppressed_hierarchy_units = HashSet::<usize>::new();
-        for (&unit_id, acc) in &unit_hits {
+        let mut exact_candidates: Vec<(usize, &HitAccumulator)> = unit_hits
+            .iter()
+            .map(|(&unit_id, acc)| (unit_id, acc))
+            .filter(|(unit_id, _)| {
+                let unit = &index.units[*unit_id];
+                unit.kind() == ReportUnitKind::ExactGene && unit.diagnostic_kmers > 0
+            })
+            .collect();
+        exact_candidates.sort_by_key(|(unit_id, _)| *unit_id);
+        for (unit_id, acc) in exact_candidates {
             let unit = &index.units[unit_id];
-            if unit.kind() != ReportUnitKind::ExactGene || unit.diagnostic_kmers == 0 {
-                continue;
-            }
             let fraction = acc.distinct.len() as f64 / unit.diagnostic_kmers as f64;
             if fraction < params.min_gene_fraction {
                 continue;
@@ -197,7 +170,8 @@ pub fn detect_fasta(
                 (fraction >= params.min_gene_group_fraction).then_some((unit_id, acc, fraction))
             })
             .collect();
-        hierarchy_candidates.sort_by_key(|(unit_id, _, _)| index.units[*unit_id].member_count);
+        hierarchy_candidates
+            .sort_by_key(|(unit_id, _, _)| (index.units[*unit_id].member_count, *unit_id));
 
         for (unit_id, acc, fraction) in hierarchy_candidates {
             if suppressed_hierarchy_units.contains(&unit_id) {
@@ -226,8 +200,6 @@ pub fn detect_fasta(
         query_kind,
         index_alphabet: index.alphabet,
         index_k: index.k,
-        refinement_mode: params.refinement_mode,
-        refinement_k: params.refinement_k,
         hits,
         gene_count,
         gene_group_count,
@@ -295,10 +267,6 @@ fn unit_hit(
         first_pass_total: acc.count,
         first_pass_diagnostic_total: unit.diagnostic_kmers,
         first_pass_fraction: first_fraction,
-        refinement_distinct: 0,
-        refinement_total: 0,
-        refinement_diagnostic_total: 0,
-        refinement_fraction: 0.0,
         call_fraction,
         call_type: unit.call_type().to_string(),
     }
@@ -519,6 +487,72 @@ ACGTACGTACGT
         .unwrap();
         assert_eq!(result.query_kind, QueryKind::Cds);
         assert_eq!(result.hits[0].query_id, "gene_1");
+    }
+
+    #[test]
+    fn hit_order_is_deterministic_and_sorted() {
+        let gene = |id: &str, node: &str, seq: &[u8]| AmrReference {
+            protein_accession: id.to_string(),
+            nucleotide_accession: id.to_string(),
+            element_symbol: id.to_string(),
+            gene_symbol: id.to_string(),
+            allele_symbol: id.to_string(),
+            product: String::new(),
+            family: node.to_string(),
+            class_name: "CLASS".to_string(),
+            subclass: "SUB".to_string(),
+            hierarchy_node: node.to_string(),
+            scope: "core".to_string(),
+            type_name: "AMR".to_string(),
+            subtype: "AMR".to_string(),
+            reportable: 2,
+            hierarchy_path: vec![HierarchyNode {
+                node_id: node.to_string(),
+                parent_node_id: String::new(),
+                symbol: node.to_string(),
+                class_name: "CLASS".to_string(),
+                subclass: "SUB".to_string(),
+                scope: "core".to_string(),
+                type_name: "AMR".to_string(),
+                subtype: "AMR".to_string(),
+                reportable: 2,
+            }],
+            db_version: "test".to_string(),
+            seq: seq.to_vec(),
+        };
+        let refs = vec![
+            gene("g1", "f1", b"ACGTACGTAAATTTCCC"),
+            gene("g2", "f2", b"GGGGGAAAAACCCCCTT"),
+            gene("g3", "f3", b"TTGGCCAATTGGAACCA"),
+        ];
+        let index = build_index(
+            &refs,
+            &IndexBuildConfig {
+                alphabet: IndexAlphabet::Dna,
+                k: 5,
+                min_exact_gene_kmers: 0,
+                min_hierarchy_unit_kmers: 1,
+            },
+        )
+        .unwrap();
+        let fasta = b">contig\nACGTACGTAAATTTCCCNGGGGGAAAAACCCCCTTNTTGGCCAATTGGAACCA\n";
+        let params = DetectParams {
+            min_gene_fraction: 0.5,
+            ..DetectParams::default()
+        };
+        let first = detect_fasta(&index, fasta, "sample", QueryKind::Direct, &params).unwrap();
+        assert_eq!(first.hits.len(), 3);
+        let ids: Vec<&str> = first.hits.iter().map(|hit| hit.unit_id.as_str()).collect();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(ids, sorted);
+        for _ in 0..5 {
+            let again = detect_fasta(&index, fasta, "sample", QueryKind::Direct, &params).unwrap();
+            assert_eq!(
+                serde_json::to_string(&again.hits).unwrap(),
+                serde_json::to_string(&first.hits).unwrap()
+            );
+        }
     }
 
     #[test]

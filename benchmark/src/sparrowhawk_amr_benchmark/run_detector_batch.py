@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -9,6 +11,14 @@ try:
     from .common import ensure_dir, read_csv, run_and_time, write_csv
 except ImportError:
     from common import ensure_dir, read_csv, run_and_time, write_csv
+
+
+def index_fingerprint(index_path: Path) -> str:
+    digest = hashlib.sha256()
+    with index_path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def run_build_index(
@@ -90,6 +100,7 @@ def run_one(
     row: dict[str, str],
     detector_bin: Path,
     index_path: Path,
+    index_sha: str,
     result_dir: Path,
     min_gene_fraction: float,
     min_gene_group_fraction: float,
@@ -99,6 +110,7 @@ def run_one(
     assembly_id = row["assembly_id"]
     fasta_path = Path(row["local_fasta_path"])
     out_json = result_dir / f"{assembly_id}.json"
+    meta_path = result_dir / f"{assembly_id}.meta.json"
     if row.get("fetch_status") not in {"downloaded", "cached"} or not fasta_path.exists():
         return {
             **row,
@@ -107,14 +119,21 @@ def run_one(
             "detector_json": "",
             "elapsed_seconds": "0",
         }
-    if out_json.exists():
-        return {
-            **row,
-            "mode": mode,
-            "detector_status": "cached",
-            "detector_json": str(out_json),
-            "elapsed_seconds": "0",
-        }
+    # Only trust a cached result produced by the exact same index; a bare JSON with no
+    # (or mismatching) fingerprint is re-run so stale calls never mix with a fresh index.
+    if out_json.exists() and meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text())
+        except json.JSONDecodeError:
+            meta = None
+        if meta and meta.get("index_sha256") == index_sha:
+            return {
+                **row,
+                "mode": mode,
+                "detector_status": "cached",
+                "detector_json": str(out_json),
+                "elapsed_seconds": "0",
+            }
 
     if mode == "direct":
         command = [
@@ -170,7 +189,19 @@ def run_one(
     )
     result = run_and_time(command)
     if result["returncode"] == 0:
-        out_json.write_text(result["stdout"])
+        tmp_json = result_dir / f"{assembly_id}.json.tmp"
+        tmp_json.write_text(result["stdout"])
+        os.replace(tmp_json, out_json)
+        meta_path.write_text(
+            json.dumps(
+                {
+                    "index_sha256": index_sha,
+                    "mode": mode,
+                    "min_gene_fraction": min_gene_fraction,
+                    "min_gene_group_fraction": min_gene_group_fraction,
+                }
+            )
+        )
     return {
         **row,
         "mode": mode,
@@ -244,6 +275,7 @@ def main() -> None:
     gene_fractions = parse_csv_floats(args.min_gene_fractions)
     gene_group_fractions = parse_csv_floats(args.min_gene_group_fractions)
 
+    built: dict[tuple[str, int], str] = {}
     for mode in modes:
         mode_ks = protein_ks if mode == "protein_cds" else ks
         alphabet = "protein" if mode == "protein_cds" else "dna"
@@ -259,18 +291,22 @@ def main() -> None:
         )
         for k in mode_ks:
             index_path = ensure_dir(args.out_dir / "indexes") / f"{alphabet}_k{k}.amridx"
-            run_build_index(detector_bin, args.db_root, index_path, k, alphabet, min_exact, min_hierarchy)
-            run_report_map(
-                detector_bin,
-                index_path,
-                ensure_dir(args.out_dir / "report_maps") / f"{alphabet}_k{k}.tsv",
-            )
-            run_unit_stats(
-                detector_bin,
-                args.db_root,
-                index_path,
-                ensure_dir(args.out_dir / "unit_stats") / f"{alphabet}_k{k}.tsv",
-            )
+            index_key = (alphabet, k)
+            if index_key not in built:
+                run_build_index(detector_bin, args.db_root, index_path, k, alphabet, min_exact, min_hierarchy)
+                run_report_map(
+                    detector_bin,
+                    index_path,
+                    ensure_dir(args.out_dir / "report_maps") / f"{alphabet}_k{k}.tsv",
+                )
+                run_unit_stats(
+                    detector_bin,
+                    args.db_root,
+                    index_path,
+                    ensure_dir(args.out_dir / "unit_stats") / f"{alphabet}_k{k}.tsv",
+                )
+                built[index_key] = index_fingerprint(index_path)
+            index_sha = built[index_key]
             for min_gene in gene_fractions:
                 gene_label = format_fraction_label(min_gene)
                 for min_family in gene_group_fractions:
@@ -286,6 +322,7 @@ def main() -> None:
                                 row,
                                 detector_bin,
                                 index_path,
+                                index_sha,
                                 result_dir,
                                 min_gene,
                                 min_family,

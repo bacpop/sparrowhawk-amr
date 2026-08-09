@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 try:
@@ -22,6 +23,13 @@ def main() -> None:
     species = read_csv(args.species_metrics) if args.species_metrics and args.species_metrics.exists() else []
     if not aggregate:
         raise SystemExit(f"No aggregate rows found in {args.aggregate_metrics}")
+    compared_counts = {row.get("assemblies_compared", "") for row in aggregate}
+    if len(compared_counts) > 1:
+        print(
+            f"WARNING: aggregate rows compare different assembly subsets ({sorted(compared_counts)}); "
+            "best-config selection may be biased by failed runs",
+            file=sys.stderr,
+        )
     best_exact = max(aggregate, key=lambda row: float(row["exact_f1"]))
     best_report_unit = max(aggregate, key=lambda row: float(row["report_unit_f1"]))
 
@@ -59,8 +67,8 @@ def main() -> None:
             "",
             "## Parameter Summary",
             "",
-            "| mode | k | gene_threshold | report_unit_threshold | exact_f1 | exact_sensitivity | exact_specificity | report_unit_f1 | report_unit_sensitivity | report_unit_specificity | assemblies_compared |",
-            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+            "| mode | k | gene_threshold | report_unit_threshold | exact_f1 | exact_sensitivity | exact_specificity | report_unit_f1 | report_unit_sensitivity | report_unit_specificity | assemblies_compared | assemblies_skipped |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
         ]
     )
     for row in sorted(
@@ -74,7 +82,7 @@ def main() -> None:
         ),
     ):
         lines.append(
-            f"| {row.get('mode', 'direct')}:{row['threshold_mode']} | {row['k']} | {row['min_gene_threshold']} | {row.get('min_report_unit_threshold', row.get('min_gene_group_threshold', ''))} | {float(row['exact_f1']):.4f} | {float(row['exact_sensitivity']):.4f} | {float(row['exact_specificity']):.4f} | {float(row['report_unit_f1']):.4f} | {float(row['report_unit_sensitivity']):.4f} | {float(row['report_unit_specificity']):.4f} | {row['assemblies_compared']} |"
+            f"| {row.get('mode', 'direct')}:{row['threshold_mode']} | {row['k']} | {row['min_gene_threshold']} | {row.get('min_report_unit_threshold', row.get('min_gene_group_threshold', ''))} | {float(row['exact_f1']):.4f} | {float(row['exact_sensitivity']):.4f} | {float(row['exact_specificity']):.4f} | {float(row['report_unit_f1']):.4f} | {float(row['report_unit_sensitivity']):.4f} | {float(row['report_unit_specificity']):.4f} | {row['assemblies_compared']} | {row.get('assemblies_skipped', '')} |"
         )
 
     ensure_dir(args.out_md.parent)

@@ -389,24 +389,32 @@ def resolve_assembly_download_url(assembly_accession: str) -> str:
 
 def download_to_path(url: str, destination: Path) -> None:
     ensure_dir(destination.parent)
-    result = shell([
-        "curl",
-        "-L",
-        "-f",
-        "--retry",
-        "3",
-        "--retry-delay",
-        "5",
-        "--retry-connrefused",
-        "-o",
-        str(destination),
-        url,
-    ])
-    if result.returncode == 0:
+    try:
+        result = shell([
+            "curl",
+            "-L",
+            "-f",
+            "--retry",
+            "3",
+            "--retry-delay",
+            "5",
+            "--retry-connrefused",
+            "-o",
+            str(destination),
+            url,
+        ])
+    except FileNotFoundError:
+        # curl binary absent; fall through to wget
+        result = None
+    if result is not None and result.returncode == 0:
         return
-    fallback = shell(["wget", "--tries=3", "--waitretry=5", "-O", str(destination), url])
+    try:
+        fallback = shell(["wget", "--tries=3", "--waitretry=5", "-O", str(destination), url])
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"neither curl nor wget is available to download {url}") from exc
     if fallback.returncode != 0:
-        raise RuntimeError(fallback.stderr.strip() or result.stderr.strip() or f"failed to download {url}")
+        curl_error = result.stderr.strip() if result is not None else "curl not found"
+        raise RuntimeError(fallback.stderr.strip() or curl_error or f"failed to download {url}")
 
 
 def decompress_gzip(source: Path, destination: Path) -> None:

@@ -5,6 +5,7 @@ import collections
 import csv
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -356,14 +357,22 @@ def detector_hit_type(hit: dict[str, Any]) -> str:
 
 
 def filter_detector_hits_by_type(payload: dict[str, Any], included_types: set[str]) -> dict[str, Any]:
-    return {
-        **payload,
-        "hits": [
-            hit
-            for hit in payload.get("hits", [])
-            if detector_hit_type(hit) in included_types
-        ],
-    }
+    hits = []
+    for hit in payload.get("hits", []):
+        hit_type = detector_hit_type(hit)
+        if not hit_type:
+            # A well-formed index guarantees every hit a type (exact units inherit the
+            # include-types-filtered gene type; hierarchy units are validated at build time),
+            # so an empty type means a corrupt or incompatible index. Silently skipping the
+            # hit would hide that defect from every metric.
+            raise ValueError(
+                f"detector hit without type_name (unit_id={hit.get('unit_id')!r}, "
+                f"query_id={hit.get('query_id')!r}, sample={payload.get('sample_name')!r}): "
+                "the index metadata is corrupt or from an incompatible detector version"
+            )
+        if hit_type in included_types:
+            hits.append(hit)
+    return {**payload, "hits": hits}
 
 
 def normalize_detector(
@@ -497,7 +506,10 @@ def is_missing_label(value: object) -> bool:
 def label_value(value: object) -> str:
     text = str(value or "").strip()
     if is_missing_label(text):
-        raise ValueError(f"Unresolved label: {value!r}")
+        raise ValueError(
+            f"Unresolved label {value!r}: index/native metadata should always provide this; "
+            "this indicates a corrupt index or an unexpected database revision"
+        )
     return text
 
 
@@ -510,7 +522,11 @@ def class_like_label(row: dict[str, Any], column: str) -> str:
         value = subtype
 
     if is_missing_label(value):
-        raise ValueError(f"Unresolved {column} after subtype fallback: {row}")
+        identity = row.get("Element symbol") or row.get("unit_id") or row.get("element_symbol")
+        raise ValueError(
+            f"Unresolved {column} after subtype fallback for {identity!r}: {row}; "
+            "this indicates a corrupt index or an unexpected database revision"
+        )
 
     return value
 
@@ -521,11 +537,11 @@ def row_label(row: dict[str, Any], column: str) -> str:
     return label_value(row.get(column, ""))
 
 
-def labels_from_amrfinder_rows(rows: list[dict[str, str]], column: str, include_blank: bool = False) -> set[str]:
+def labels_from_amrfinder_rows(rows: list[dict[str, str]], column: str) -> set[str]:
     return {row_label(row, column) for row in rows}
 
 
-def labels_from_detector_hits(payload: dict[str, Any], field: str, include_blank: bool = False) -> set[str]:
+def labels_from_detector_hits(payload: dict[str, Any], field: str) -> set[str]:
     return {row_label(hit, field) for hit in payload.get("hits", [])}
 
 
@@ -620,8 +636,10 @@ def main() -> None:
     included_types = {value.strip().upper() for value in args.include_types.split(",") if value.strip()}
     hierarchy = load_hierarchy(args.hierarchy)
     amrfinder_status = {}
+    native_failed_ids = set()
     for row in read_csv(args.amrfinder_status):
         if row.get("returncode") != "0":
+            native_failed_ids.add(row["assembly_id"])
             continue
         if row.get("tsv_path"):
             row = {**row, "tsv_path": str(resolve_existing_path(row["tsv_path"], args.amrfinder_status.parent))}
@@ -658,6 +676,7 @@ def main() -> None:
     type_rows = []
     all_truth_rows = []
     all_detector_rows = []
+    skipped_rows = []
 
     for status_csv in status_paths:
         params = params_by_status[status_csv]
@@ -678,10 +697,29 @@ def main() -> None:
         species_class_universes: dict[str, dict[str, set[str]]] = collections.defaultdict(empty_universes)
         type_universes: dict[str, dict[str, set[str]]] = collections.defaultdict(empty_universes)
         per_assembly = []
+        skipped_count = 0
         for row in read_csv(status_csv):
             assembly_id = row["assembly_id"]
             baseline_row = amrfinder_status.get(assembly_id)
-            if not baseline_row or row.get("detector_status") not in {"ok", "cached"}:
+            detector_ok = row.get("detector_status") in {"ok", "cached"}
+            if not baseline_row or not detector_ok:
+                reasons = []
+                if not baseline_row:
+                    reasons.append(
+                        "native_failed" if assembly_id in native_failed_ids else "native_missing"
+                    )
+                if not detector_ok:
+                    reasons.append(f"detector_{row.get('detector_status') or 'missing'}")
+                skipped_rows.append(
+                    {
+                        **params,
+                        "assembly_id": assembly_id,
+                        "species": row.get("species", ""),
+                        "detector_status": row.get("detector_status", ""),
+                        "reason": ";".join(reasons),
+                    }
+                )
+                skipped_count += 1
                 continue
 
             native_rows = reportable_rows(Path(baseline_row["tsv_path"]), included_types)
@@ -873,7 +911,11 @@ def main() -> None:
             f"report_unit_{params['min_report_unit_threshold']}_assemblies.csv"
         )
         write_csv(args.out_dir / out_name, list(per_assembly[0].keys()) if per_assembly else [], per_assembly)
-        aggregate_rows.append(metric_row(params, micro))
+        print(
+            f"{out_name}: compared {len(per_assembly)} assemblies, skipped {skipped_count}",
+            file=sys.stderr,
+        )
+        aggregate_rows.append(metric_row({**params, "assemblies_skipped": skipped_count}, micro))
         species_rows.extend(grouped_rows(species_micro, params, ("species",)))
         class_rows.extend(grouped_rows(class_micro, params, ("type_name", "subtype", "class_name")))
         subclass_rows.extend(grouped_rows(subclass_micro, params, ("subclass",)))
@@ -888,6 +930,8 @@ def main() -> None:
     write_csv(args.out_dir / "type_metrics.csv", list(type_rows[0].keys()) if type_rows else [], type_rows)
     write_csv(args.out_dir / "all_truth_report_units.csv", list(all_truth_rows[0].keys()) if all_truth_rows else [], all_truth_rows)
     write_csv(args.out_dir / "all_detector_report_units.csv", list(all_detector_rows[0].keys()) if all_detector_rows else [], all_detector_rows)
+    # Named so it does NOT match the analyzer's "*_assemblies.csv" per-config glob.
+    write_csv(args.out_dir / "assemblies_skipped.csv", list(skipped_rows[0].keys()) if skipped_rows else [], skipped_rows)
 
 
 if __name__ == "__main__":

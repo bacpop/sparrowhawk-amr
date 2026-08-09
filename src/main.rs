@@ -7,10 +7,9 @@ mod native {
     use clap::{Parser, Subcommand, ValueEnum};
     use sparrowhawk_amr::{
         DebugMissesConfig, DetectParams, GeneCallerConfig, IndexAlphabet, IndexBuildConfig,
-        QueryKind, ReferenceType, RefinementMode, TruthKmerEvidenceConfig, build_index,
-        debug_amrfinder_misses, detect_fasta, detect_protein_fasta,
-        load_amrfinder_protein_references, load_amrfinder_references, load_index, run_gene_caller,
-        save_index,
+        QueryKind, ReferenceType, TruthKmerEvidenceConfig, build_index, debug_amrfinder_misses,
+        detect_fasta, detect_protein_fasta, load_amrfinder_protein_references,
+        load_amrfinder_references, load_index, run_gene_caller, save_index,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -223,21 +222,6 @@ mod native {
             default_value_t = 0.10
         )]
         min_gene_group_fraction: f64,
-        #[arg(long, default_value_t = 0.01)]
-        seed_gene_fraction: f64,
-        #[arg(long, default_value_t = 3)]
-        seed_gene_hits: usize,
-        #[arg(long, value_enum, default_value_t = RefinementArg::None)]
-        refinement_mode: RefinementArg,
-        #[arg(long, default_value_t = 21)]
-        refinement_k: usize,
-    }
-
-    #[derive(Debug, Clone, Copy, ValueEnum)]
-    enum RefinementArg {
-        None,
-        Split,
-        Lowk,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -267,16 +251,6 @@ mod native {
         orphos_translation_table: Option<u8>,
     }
 
-    impl From<RefinementArg> for RefinementMode {
-        fn from(value: RefinementArg) -> Self {
-            match value {
-                RefinementArg::None => Self::None,
-                RefinementArg::Split => Self::Split,
-                RefinementArg::Lowk => Self::LowK,
-            }
-        }
-    }
-
     impl From<IndexAlphabetArg> for IndexAlphabet {
         fn from(value: IndexAlphabetArg) -> Self {
             match value {
@@ -301,10 +275,6 @@ mod native {
             Self {
                 min_gene_fraction: value.min_gene_fraction,
                 min_gene_group_fraction: value.min_gene_group_fraction,
-                seed_gene_fraction: value.seed_gene_fraction,
-                seed_gene_hits: value.seed_gene_hits,
-                refinement_mode: value.refinement_mode.into(),
-                refinement_k: value.refinement_k,
             }
         }
     }
@@ -710,14 +680,23 @@ mod native {
             let out = out_dir.join(file);
             let status = Command::new("curl")
                 .arg("-L")
+                .arg("--fail")
+                .arg("--retry")
+                .arg("3")
+                .arg("--retry-delay")
+                .arg("5")
+                .arg("--retry-connrefused")
                 .arg("-o")
                 .arg(&out)
                 .arg(&url)
                 .status()
                 .with_context(|| format!("run curl for {url}"))?;
             if !status.success() {
+                let _ = fs::remove_file(&out);
                 bail!("curl failed for {url} with status {status}");
             }
+            let size = fs::metadata(&out).map(|meta| meta.len()).unwrap_or(0);
+            anyhow::ensure!(size > 0, "downloaded file {} is empty", out.display());
         }
         Ok(())
     }
@@ -750,6 +729,7 @@ mod native {
         out: &Path,
     ) -> anyhow::Result<()> {
         let output = Command::new(amrfinder_path)
+            .arg("--plus")
             .arg("-n")
             .arg(assembly)
             .arg("-d")

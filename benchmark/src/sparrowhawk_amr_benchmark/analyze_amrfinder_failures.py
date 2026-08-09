@@ -4,6 +4,7 @@ import argparse
 import collections
 import csv
 import json
+import re
 import statistics
 import subprocess
 from pathlib import Path
@@ -233,12 +234,18 @@ def fraction(matched: object, total: object) -> str:
     return f"{numerator / denominator:.6f}"
 
 
-def parse_mode_file(path: Path) -> tuple[str, int]:
-    # direct_k_31_fraction_gene_0.100_gene_group_0.100_assemblies.csv
-    parts = path.name.split("_")
-    if path.name.startswith("protein_cds_"):
-        return "protein_cds", int(parts[3])
-    return parts[0], int(parts[2])
+MODE_FILE_RE = re.compile(
+    r"^(?P<mode>direct|cds|protein_cds)_k_(?P<k>\d+)_(?P<tmode>fraction|absolute)"
+    r"_gene_(?P<gene>.+?)_(?:report_unit|gene_group)_(?P<unit>.+?)_assemblies$"
+)
+
+
+def parse_mode_file(path: Path) -> tuple[str, int, str, str, str]:
+    # e.g. direct_k_31_fraction_gene_0.100_report_unit_0.100_assemblies.csv
+    match = MODE_FILE_RE.fullmatch(path.stem)
+    if not match:
+        raise ValueError(f"Unexpected comparison filename: {path.name}")
+    return match["mode"], int(match["k"]), match["tmode"], match["gene"], match["unit"]
 
 
 def pct(values: list[float], threshold: float) -> float:
@@ -270,10 +277,10 @@ def main() -> None:
     missed_unit_rows = []
     detector_only_rows = []
     truth_evidence_rows = []
-    per_unit: dict[tuple[str, int, str], collections.Counter[str]] = collections.defaultdict(collections.Counter)
+    per_unit: dict[tuple[str, int, str, str, str], collections.Counter[str]] = collections.defaultdict(collections.Counter)
 
     for assembly_csv in sorted(args.comparison_dir.glob("*_assemblies.csv")):
-        mode, k = parse_mode_file(assembly_csv)
+        mode, k, _threshold_mode, gene_thr, unit_thr = parse_mode_file(assembly_csv)
         report_map_rows = load_report_map_rows(report_map_path(args.report_map_root, mode, k))
         report_map = report_map_lookup(report_map_rows)
         report_context = report_map_context(report_map_rows, hierarchy, included_types)
@@ -317,6 +324,8 @@ def main() -> None:
                     evidence_row = {
                         "mode": mode,
                         "k": k,
+                        "min_gene_threshold": gene_thr,
+                        "min_report_unit_threshold": unit_thr,
                         "assembly_id": row["assembly_id"],
                         "species": row.get("species", ""),
                         "antibiotic_classes": row.get("classes", ""),
@@ -338,11 +347,11 @@ def main() -> None:
             missed_units.update(missed)
             detector_units.update(detector_only)
             for unit in truth_units - missed:
-                per_unit[(mode, k, unit)]["tp"] += 1
+                per_unit[(mode, k, gene_thr, unit_thr, unit)]["tp"] += 1
             for unit in missed:
-                per_unit[(mode, k, unit)]["fn"] += 1
+                per_unit[(mode, k, gene_thr, unit_thr, unit)]["fn"] += 1
             for unit in detector_only:
-                per_unit[(mode, k, unit)]["fp"] += 1
+                per_unit[(mode, k, gene_thr, unit_thr, unit)]["fp"] += 1
             for native_row in native_rows:
                 unit = report_unit_for_native(native_row, report_map)
                 if unit in missed:
@@ -353,6 +362,8 @@ def main() -> None:
                         {
                             "mode": mode,
                             "k": k,
+                            "min_gene_threshold": gene_thr,
+                            "min_report_unit_threshold": unit_thr,
                             "assembly_id": row["assembly_id"],
                             "species": row.get("species", ""),
                             "antibiotic_classes": row.get("classes", ""),
@@ -384,6 +395,8 @@ def main() -> None:
                         {
                             "mode": mode,
                             "k": k,
+                            "min_gene_threshold": gene_thr,
+                            "min_report_unit_threshold": unit_thr,
                             "assembly_id": row["assembly_id"],
                             "species": row.get("species", ""),
                             "antibiotic_classes": row.get("classes", ""),
@@ -412,6 +425,8 @@ def main() -> None:
             {
                 "mode": mode,
                 "k": k,
+                "min_gene_threshold": gene_thr,
+                "min_report_unit_threshold": unit_thr,
                 "assemblies": len(rows),
                 "exact_fn": total_exact_fn,
                 "report_unit_fn": total_report_unit_fn,
@@ -434,11 +449,28 @@ def main() -> None:
     write_csv(args.out_dir / "detector_only_report_units.csv", list(detector_only_rows[0].keys()) if detector_only_rows else [], detector_only_rows)
     write_csv(args.out_dir / "truth_kmer_evidence.csv", list(truth_evidence_rows[0].keys()) if truth_evidence_rows else [], truth_evidence_rows)
 
-    missed_counts = collections.Counter(row["report_unit"] for row in missed_unit_rows)
+    missed_counts = collections.Counter(
+        (
+            row["mode"],
+            row["k"],
+            row["min_gene_threshold"],
+            row["min_report_unit_threshold"],
+            row["report_unit"],
+        )
+        for row in missed_unit_rows
+    )
     missed_priority_rows = sorted(
         missed_unit_rows,
         key=lambda row: (
-            missed_counts[row["report_unit"]],
+            missed_counts[
+                (
+                    row["mode"],
+                    row["k"],
+                    row["min_gene_threshold"],
+                    row["min_report_unit_threshold"],
+                    row["report_unit"],
+                )
+            ],
             numeric(row.get("best_diagnostic_fraction", row.get("diagnostic_fraction", 0))),
             numeric(row.get("best_diagnostic_matched", row.get("diagnostic_matched", 0))),
             numeric(row.get("identity", 0)),
@@ -448,18 +480,28 @@ def main() -> None:
     )
     write_csv(args.out_dir / "missed_truth_priority.csv", list(missed_priority_rows[0].keys()) if missed_priority_rows else [], missed_priority_rows)
 
-    missed_summary_counter: dict[tuple[str, str, str], collections.Counter[str]] = collections.defaultdict(collections.Counter)
+    missed_summary_counter: dict[tuple[str, str, str, str, str], collections.Counter[str]] = collections.defaultdict(collections.Counter)
     for row in missed_unit_rows:
-        key = (row.get("report_unit", ""), row.get("method", ""), row.get("recall_failure_category", ""))
+        key = (
+            str(row.get("min_gene_threshold", "")),
+            str(row.get("min_report_unit_threshold", "")),
+            row.get("report_unit", ""),
+            row.get("method", ""),
+            row.get("recall_failure_category", ""),
+        )
         missed_summary_counter[key]["count"] += 1
     missed_summary_rows = [
         {
+            "min_gene_threshold": gene_threshold,
+            "min_report_unit_threshold": unit_threshold,
             "report_unit": report_unit,
             "method": method,
             "recall_failure_category": category,
             "misses": counts["count"],
         }
-        for (report_unit, method, category), counts in sorted(missed_summary_counter.items())
+        for (gene_threshold, unit_threshold, report_unit, method, category), counts in sorted(
+            missed_summary_counter.items()
+        )
     ]
     write_csv(args.out_dir / "missed_truth_summary.csv", list(missed_summary_rows[0].keys()) if missed_summary_rows else [], missed_summary_rows)
 
@@ -467,12 +509,14 @@ def main() -> None:
         {
             "mode": mode,
             "k": k,
+            "min_gene_threshold": gene_threshold,
+            "min_report_unit_threshold": unit_threshold,
             "report_unit": unit,
             "tp": counts["tp"],
             "fp": counts["fp"],
             "fn": counts["fn"],
         }
-        for (mode, k, unit), counts in sorted(per_unit.items())
+        for (mode, k, gene_threshold, unit_threshold, unit), counts in sorted(per_unit.items())
     ]
     write_csv(args.out_dir / "report_unit_failure_summary.csv", list(per_unit_rows[0].keys()) if per_unit_rows else [], per_unit_rows)
 
