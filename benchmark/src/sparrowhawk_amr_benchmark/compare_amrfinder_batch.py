@@ -82,6 +82,13 @@ def load_tsv(path: Path) -> list[dict[str, str]]:
 def resolve_existing_path(raw: str, base_dir: Path) -> Path:
     path = Path(raw)
     if path.is_absolute():
+        if path.exists():
+            return path
+        # Result trees copied from another machine keep that host's absolute
+        # paths; fall back to the local layout next to the status CSV.
+        for candidate in (base_dir / path.name, base_dir / path.parent.name / path.name):
+            if candidate.exists():
+                return candidate
         return path
     candidate = base_dir / path
     if candidate.exists():
@@ -158,6 +165,20 @@ def report_map_context(rows: list[dict[str, str]], hierarchy: dict[str, dict[str
         for row in rows
         if row.get("type", "").strip().upper() in included_types and row.get("hierarchy_node", "")
     }
+    # Merged fusion references carry a comma-separated part list as their
+    # hierarchy_node (e.g. "estX,sat2_fam"); map every token shape a fusion
+    # unit can appear under (comma node, canonical report-unit key, slash
+    # element symbol) to its part node tokens.
+    fusion_parts: dict[str, set[str]] = {}
+    for row in rows:
+        node = row.get("hierarchy_node", "")
+        if "," not in node:
+            continue
+        parts = {part.strip() for part in node.split(",") if part.strip()}
+        for key in (node, canonical_report_node(row.get("report_unit_key", "")), row.get("element_symbol", "")):
+            if key:
+                fusion_parts.setdefault(key, set()).update(parts)
+
     children = hierarchy_children(hierarchy)
     descendant_cache: dict[str, set[str]] = {}
 
@@ -176,7 +197,22 @@ def report_map_context(rows: list[dict[str, str]], hierarchy: dict[str, dict[str
 
     for node in list(report_nodes):
         descendants(node)
-    return {"report_nodes": report_nodes, "descendants": descendant_cache, "descendant_fn": descendants}
+    return {
+        "report_nodes": report_nodes,
+        "descendants": descendant_cache,
+        "descendant_fn": descendants,
+        "fusion_parts": fusion_parts,
+    }
+
+
+def fusion_part_nodes(node: str, context: dict[str, Any] | None) -> set[str]:
+    if context is not None:
+        parts = context.get("fusion_parts", {}).get(node)
+        if parts:
+            return parts
+    if "," in node:
+        return {part.strip() for part in node.split(",") if part.strip()}
+    return set()
 
 
 def report_unit_coverage(node: str, context: dict[str, Any] | None) -> set[str]:
@@ -185,7 +221,10 @@ def report_unit_coverage(node: str, context: dict[str, Any] | None) -> set[str]:
         return set()
     if context is None:
         return {node}
-    covered = context["descendant_fn"](node)
+    covered = set(context["descendant_fn"](node))
+    # A merged-fusion call covers each of its parts' subtrees.
+    for part in fusion_part_nodes(node, context):
+        covered |= context["descendant_fn"](part)
     return covered or {node}
 
 
@@ -220,7 +259,13 @@ def report_unit_covers(detector_node: str, truth_node: str, context: dict[str, A
     if context is None:
         return False
 
-    return truth_node in report_unit_coverage(detector_node, context)
+    coverage = report_unit_coverage(detector_node, context)
+    if truth_node in coverage:
+        return True
+
+    # A fusion truth element is covered when any of its parts is covered
+    # (consistent with the one-sided ancestor-coverage policy).
+    return any(part in coverage for part in fusion_part_nodes(truth_node, context))
 
 
 def metric_universes(
