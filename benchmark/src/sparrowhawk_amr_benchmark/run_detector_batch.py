@@ -247,7 +247,7 @@ def main() -> None:
     parser.add_argument("--modes", type=str, default="direct")
     parser.add_argument("--ks", type=str, default="15,17,21,31")
     parser.add_argument("--protein-ks", type=str, default="5")
-    parser.add_argument("--min-gene-fractions", type=str, default="0.02,0.05,0.10")
+    parser.add_argument("--min-gene-fractions", type=str, default="0.30")
     parser.add_argument(
         "--min-report-unit-fractions",
         "--min-gene-group-fractions",

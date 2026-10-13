@@ -203,7 +203,7 @@ mod native {
                 ReferenceTypeArg::Virulence,
             ])]
             include_types: Vec<ReferenceTypeArg>,
-            #[arg(long, default_value_t = 0.10)]
+            #[arg(long, default_value_t = 0.30)]
             min_gene_fraction: f64,
             #[arg(long, default_value_t = 0.10)]
             min_family_fraction: f64,
@@ -214,7 +214,7 @@ mod native {
 
     #[derive(Parser, Debug, Clone)]
     struct DetectArgs {
-        #[arg(long, default_value_t = 0.10)]
+        #[arg(long, default_value_t = 0.30)]
         min_gene_fraction: f64,
         #[arg(
             long = "min-gene-group-fraction",

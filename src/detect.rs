@@ -22,7 +22,7 @@ pub struct DetectParams {
 impl Default for DetectParams {
     fn default() -> Self {
         Self {
-            min_gene_fraction: 0.10,
+            min_gene_fraction: 0.30,
             min_gene_group_fraction: 0.10,
         }
     }
