@@ -178,7 +178,6 @@ impl Iterator for ProteinKmerIter<'_> {
     }
 }
 
-
 // Split helpers for testing if they work
 pub fn split_window(seq: &[u8]) -> Option<u64> {
     let k = seq.len();
@@ -236,7 +235,6 @@ impl Iterator for SplitKmerIter<'_> {
 }
 
 // // =================================================== TEST
-
 
 #[cfg(test)]
 mod tests {

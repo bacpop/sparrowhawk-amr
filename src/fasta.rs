@@ -59,7 +59,6 @@ pub fn parse_fasta_bytes(bytes: &[u8]) -> anyhow::Result<Vec<FastaRecord>> {
     Ok(records)
 }
 
-
 // =================== TEST
 #[cfg(test)]
 mod tests {
