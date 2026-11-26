@@ -2,6 +2,17 @@
 name = "sparrowhawk-amr"
 version = "0.1.0"
 edition = "2024"
+description = "Offline k-mer detector of antimicrobial resistance genes based on the AMRFinderPlus database, native and WebAssembly"
+repository = "https://github.com/bacpop/sparrowhawk-amr"
+homepage = "https://bacpop.org/software/"
+readme = "README.md"
+include = [
+    "/Cargo.toml",
+    "/README.md",
+    "/src",
+]
+keywords = ["bioinformatics", "genomics", "antimicrobial", "amr", "k-mer"]
+categories = ["command-line-utilities", "science::bioinformatics", "wasm"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]

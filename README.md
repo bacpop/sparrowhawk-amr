@@ -31,6 +31,26 @@ Current **main features**:
 - Evaluation and debugging tooling against native AMRFinderPlus runs (`eval` subcommands), plus a Python-based benchmark suite in [`benchmark`](./benchmark) (see its own README).
 - Compilation both to native and WebAssembly targets: the wasm build exposes an `AmrDetector` interface to load an index and detect from the browser.
 
+# Citation
+
+The algorithm of this repository is depicted currently in Sparrowhawk's preprint on [bioRxiv (2026.11.18.767565)](https://www.biorxiv.org/content/10.64898/2026.11.18.767565). You may use the following bibtex entry:
+
+```bibtex
+@article{rodriguez-bouza2026sparrowhawk,
+	author    = {Rodr{\'\i}guez-Bouza, V{\'\i}ctor and von Wachsmann, Johanna H. and Constantinides, Bede and Andr{\'e}oletti, Antoine and Odih, Erkison E. and Nesterenko, Luca and Gupta, Vikas and Lees, John A.},
+	title     = {{Sparrowhawk}: harnessing {WebAssembly} for private microbial genomics, and beyond},
+	journal   = {bioRxiv},
+	year      = {2026},
+	month     = nov,
+	eid       = {2026.11.18.767565},
+	doi       = {10.64898/2026.11.18.767565},
+	url       = {https://www.biorxiv.org/content/10.64898/2026.11.18.767565v1},
+	publisher = {Cold Spring Harbor Laboratory},
+	note      = {Preprint}
+}
+```
+
+
 # Installation
 Currently the only option is to compile from source. You will need the [rust toolchain](https://www.rust-lang.org/tools/install) installed in your system. Development has been done only on x86_64 GNU/Linux-based systems, and most surely will probably stay that way (i.e. no other systems have been tested). To get an in principle working version (up to some degree), always clone a versioned tag. E.g. to get version vX.Y.Z, you could use:
 
